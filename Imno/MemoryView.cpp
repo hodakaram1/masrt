@@ -376,17 +376,18 @@ void MemoryView_RefreshModules() {
     // Try ToolHelp first (works for non-protected)
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_SelectedPid);
     if (hSnap != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32 me{};
+        MODULEENTRY32W me{};
         me.dwSize = sizeof(me);
-        if (Module32First(hSnap, &me)) {
+        if (Module32FirstW(hSnap, &me)) {
             do {
                 ModuleInfoFull mod{};
                 mod.base = (ULONG_PTR)me.modBaseAddr;
                 mod.size = me.modBaseSize;
-                strcpy_s(mod.name, sizeof(mod.name), me.szModule);
-                strcpy_s(mod.path, sizeof(mod.path), me.szExePath);
+                // Convert WCHAR to UTF8 char
+                WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, mod.name, sizeof(mod.name), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, mod.path, sizeof(mod.path), NULL, NULL);
                 g_MemView.modules.push_back(mod);
-            } while (Module32Next(hSnap, &me));
+            } while (Module32NextW(hSnap, &me));
         }
         CloseHandle(hSnap);
         if (!g_MemView.modules.empty()) {
