@@ -216,19 +216,12 @@ bool DbkGetWow64Peb(ULONG pid, ULONG64* outWow64Peb);
 bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
 // =====================================================================
-//  Workers / UI - simplified (Cheat Table only - Memory View & Scanner removed)
+//  Workers / UI - simplified (only Memory Scanner, Cheat Table)
 // =====================================================================
 void FreezeLoop();
 void RefreshProcessList();
-
-// =====================================================================
-//  Globals
-// =====================================================================
-extern HWND g_hWnd;
-extern HANDLE g_hDriver;
-extern bool g_DriverConnected;
-extern std::vector<ProcessInfo> g_ProcessList;
-extern ULONG g_SelectedPid;
-extern bool g_SelectedIs64;
-extern std::vector<CheatItem> g_CheatTable;
-extern std::mutex g_CheatTableLock;
+void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned);
+void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults);
+void StartFirstScan();
+void StartNextScan();
+void ExportResultsToFile();
