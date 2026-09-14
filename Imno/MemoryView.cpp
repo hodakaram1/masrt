@@ -129,17 +129,17 @@ const char* MemoryView_ProtectToString(ULONG protect) {
             // Check combinations
             static char buf[64];
             buf[0] = 0;
-            if (protect & PAGE_GUARD) strcat_s(buf, "G+");
-            if (protect & PAGE_NOACCESS) strcat_s(buf, "NA");
+            if (protect & PAGE_GUARD) strcat_s(buf, sizeof(buf), "G+");
+            if (protect & PAGE_NOACCESS) strcat_s(buf, sizeof(buf), "NA");
             else {
                 if (protect & PAGE_EXECUTE) {
-                    if (protect & PAGE_READWRITE) strcat_s(buf, "RWX");
-                    else if (protect & PAGE_READONLY) strcat_s(buf, "RX");
-                    else strcat_s(buf, "X");
+                    if (protect & PAGE_READWRITE) strcat_s(buf, sizeof(buf), "RWX");
+                    else if (protect & PAGE_READONLY) strcat_s(buf, sizeof(buf), "RX");
+                    else strcat_s(buf, sizeof(buf), "X");
                 } else {
-                    if (protect & PAGE_READWRITE) strcat_s(buf, "RW");
-                    else if (protect & PAGE_READONLY) strcat_s(buf, "R");
-                    else strcat_s(buf, "?");
+                    if (protect & PAGE_READWRITE) strcat_s(buf, sizeof(buf), "RW");
+                    else if (protect & PAGE_READONLY) strcat_s(buf, sizeof(buf), "R");
+                    else strcat_s(buf, sizeof(buf), "?");
                 }
             }
             return buf;
@@ -196,7 +196,7 @@ void MemoryView_RefreshDisasm() {
                 line.bytes[0] = chunk[offset];
                 sprintf_s(line.bytesStr, "%02X", line.bytes[0]);
                 sprintf_s(line.text, "db 0x%02X", line.bytes[0]);
-                strcpy_s(line.mnemonic, "db");
+                strcpy_s(line.mnemonic, sizeof(line.mnemonic), "db");
                 offset += 1;
                 g_MemView.disasmLines.push_back(line);
                 linesDecoded++;
@@ -226,7 +226,7 @@ void MemoryView_RefreshDisasm() {
             // Mnemonic
             const char* mn = ZydisMnemonicGetString(instr.mnemonic);
             if (mn) strcpy_s(line.mnemonic, sizeof(line.mnemonic), mn);
-            else strcpy_s(line.mnemonic, "???");
+            else strcpy_s(line.mnemonic, sizeof(line.mnemonic), "???");
 
             // Branch detection
             line.isBranch = false;
@@ -307,12 +307,12 @@ void MemoryView_RefreshRegions() {
         r.base = base;
         r.size = length;
         r.protect = prot;
-        strcpy_s(r.protectStr, MemoryView_ProtectToString(prot));
+        strcpy_s(r.protectStr, sizeof(r.protectStr), MemoryView_ProtectToString(prot));
         r.readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
         r.writable = (prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         r.executable = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-        strcpy_s(r.stateStr, "COMMIT");
-        strcpy_s(r.typeStr, "PRIVATE");
+        strcpy_s(r.stateStr, sizeof(r.stateStr), "COMMIT");
+        strcpy_s(r.typeStr, sizeof(r.typeStr), "PRIVATE");
         g_MemView.regions.push_back(r);
 
         cursor = end;
@@ -371,17 +371,18 @@ void MemoryView_RefreshModules() {
     // Try ToolHelp first (works for non-protected)
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_SelectedPid);
     if (hSnap != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32 me{};
+        MODULEENTRY32W me{};
         me.dwSize = sizeof(me);
-        if (Module32First(hSnap, &me)) {
+        if (Module32FirstW(hSnap, &me)) {
             do {
                 ModuleInfoFull mod{};
                 mod.base = (ULONG_PTR)me.modBaseAddr;
                 mod.size = me.modBaseSize;
-                strcpy_s(mod.name, me.szModule);
-                strcpy_s(mod.path, me.szExePath);
+                // Convert WCHAR to UTF8
+                WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, mod.name, sizeof(mod.name), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, mod.path, sizeof(mod.path), NULL, NULL);
                 g_MemView.modules.push_back(mod);
-            } while (Module32Next(hSnap, &me));
+            } while (Module32NextW(hSnap, &me));
         }
         CloseHandle(hSnap);
         if (!g_MemView.modules.empty()) {
@@ -459,8 +460,8 @@ void MemoryView_RefreshModules() {
                 ModuleInfoFull mod{};
                 mod.base = dllBase;
                 mod.size = size;
-                strcpy_s(mod.name, baseName.c_str());
-                strcpy_s(mod.path, full.c_str());
+                strcpy_s(mod.name, sizeof(mod.name), baseName.c_str());
+                strcpy_s(mod.path, sizeof(mod.path), full.c_str());
                 g_MemView.modules.push_back(mod);
             }
             // Next
@@ -487,8 +488,8 @@ void MemoryView_RefreshModules() {
                 ModuleInfoFull mod{};
                 mod.base = (ULONG_PTR)dllBase;
                 mod.size = size;
-                strcpy_s(mod.name, baseName.c_str());
-                strcpy_s(mod.path, full.c_str());
+                strcpy_s(mod.name, sizeof(mod.name), baseName.c_str());
+                strcpy_s(mod.path, sizeof(mod.path), full.c_str());
                 g_MemView.modules.push_back(mod);
             }
             ULONG64 next = 0;
@@ -648,11 +649,11 @@ void MemoryView_Init() {
     g_MemView = MemViewState(); // reset via default ctor
     g_MemView.disasmAddr = 0x00400000;
     g_MemView.hexAddr = 0x00400000;
-    strcpy_s(g_MemView.addrInput, "0x00400000");
-    strcpy_s(g_MemView.hexAddrInput, "0x00400000");
-    strcpy_s(g_MemView.allocSizeInput, "0x1000");
-    strcpy_s(g_MemView.searchPatternInput, "");
-    strcpy_s(g_MemView.asmInput, "nop");
+    strcpy_s(g_MemView.addrInput, sizeof(g_MemView.addrInput), "0x00400000");
+    strcpy_s(g_MemView.hexAddrInput, sizeof(g_MemView.hexAddrInput), "0x00400000");
+    strcpy_s(g_MemView.allocSizeInput, sizeof(g_MemView.allocSizeInput), "0x1000");
+    strcpy_s(g_MemView.searchPatternInput, sizeof(g_MemView.searchPatternInput), "");
+    strcpy_s(g_MemView.asmInput, sizeof(g_MemView.asmInput), "nop");
     g_MemView.disasmLineCount = 80;
     g_MemView.bytesPerRow = 16;
     g_MemView.stringMinLen = 5;
@@ -737,7 +738,7 @@ static void RenderDisasmLine(const DisasmLine& line, int idx, bool isSelected) {
             std::lock_guard<std::mutex> lock(g_CheatTableLock);
             char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)line.address);
             g_CheatTable.push_back({line.address, 0, false, 4, g_SelectedPid, ""});
-            strcpy_s(g_CheatTable.back().Description, desc);
+            strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc);
         }
         if (ImGui::MenuItem("NOP this instruction")) {
             std::vector<BYTE> nops(line.length, 0x90);
@@ -746,7 +747,7 @@ static void RenderDisasmLine(const DisasmLine& line, int idx, bool isSelected) {
         }
         if (ImGui::MenuItem("Assemble...")) {
             g_MemView.asmAddr = line.address;
-            strcpy_s(g_MemView.asmInput, line.text);
+            strcpy_s(g_MemView.asmInput, sizeof(g_MemView.asmInput), line.text);
             g_MemView.showAsmPopup = true;
         }
         if (ImGui::MenuItem("Bookmark this address")) {
@@ -949,7 +950,7 @@ void MemoryView_Render() {
                                 std::lock_guard<std::mutex> lock(g_CheatTableLock);
                                 char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)(rowAddr + c));
                                 g_CheatTable.push_back({rowAddr + c, b, false, 3, g_SelectedPid, ""});
-                                strcpy_s(g_CheatTable.back().Description, desc);
+                                strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc);
                             }
                             ImGui::EndPopup();
                         }
@@ -1225,7 +1226,7 @@ void MemoryView_Render() {
             if (g_MemView.isSearching) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("Searching... %d%%", g_MemView.searchProgress);
-                ImGui::ProgressBar(g_MemView.searchProgress / 100.0f, ImVec2(200, 0));
+                ImGui::ProgressBar((float)g_MemView.searchProgress / 100.0f, ImVec2(200, 0));
             } else {
                 if (!g_MemView.searchResults.empty()) {
                     ImGui::Text("Found %zu results:", g_MemView.searchResults.size());
