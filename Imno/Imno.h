@@ -23,6 +23,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_dx11.h"
 #include "Resource.h"
+#include "Version.h"
 
 // =====================================================================
 //  DBK64 Kernel Driver Configuration
@@ -216,7 +217,7 @@ bool DbkGetWow64Peb(ULONG pid, ULONG64* outWow64Peb);
 bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
 // =====================================================================
-//  Workers / UI - simplified (only Memory Scanner, Cheat Table)
+//  Workers / UI - simplified (only Memory Scanner, Cheat Table, Memory View)
 // =====================================================================
 void FreezeLoop();
 void RefreshProcessList();
@@ -225,3 +226,15 @@ void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std
 void StartFirstScan();
 void StartNextScan();
 void ExportResultsToFile();
+
+// =====================================================================
+//  Globals (shared with MemoryView)
+// =====================================================================
+extern HWND g_hWnd;
+extern HANDLE g_hDriver;
+extern bool g_DriverConnected;
+extern std::vector<ProcessInfo> g_ProcessList;
+extern ULONG g_SelectedPid;
+extern bool g_SelectedIs64;
+extern std::vector<CheatItem> g_CheatTable;
+extern std::mutex g_CheatTableLock;
