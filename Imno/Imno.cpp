@@ -1,6 +1,4 @@
 #include "Imno.h"
-#include "MemoryView.h"
-#include "MemoryScanner.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -11,7 +9,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// Globals - simplified (only Memory Scanner, Cheat Table)
+// Globals
 HWND g_hWnd = NULL;
 GLFWwindow* g_Window = NULL;
 HANDLE g_hDriver = INVALID_HANDLE_VALUE;
@@ -20,23 +18,7 @@ bool   g_DriverConnected = false;
 std::vector<ProcessInfo> g_ProcessList;
 ULONG g_SelectedPid = 0;
 char  g_ProcessFilter[64] = "";
-
-// Scan State
-int   g_SelectedDataType = 4; // 4 = 4 Bytes
-char  g_ScanValueInput[128] = "";
-char  g_ScanRangeStart[64] = "0x10000";
-char  g_ScanRangeEnd[64] = "0x7FFFFFFFFFFF";
-bool  g_UseScanRange = false;
-bool  g_AllowUnaligned = false;
-
-std::vector<ULONG_PTR> g_ScanResults;
-std::mutex             g_ScanResultsLock;
-std::atomic<bool>      g_IsScanning(false);
-std::atomic<int>       g_ScanProgress(0);
-std::atomic<bool>      g_ScanTruncated(false);
-std::atomic<unsigned>  g_ScanVersion(0);
-int                    g_ResultsDataType = 4;
-bool                   g_SelectedIs64 = true;
+bool  g_SelectedIs64 = true;
 
 // Cheat Table & Freeze
 std::vector<CheatItem> g_CheatTable;
@@ -44,7 +26,7 @@ std::mutex g_CheatTableLock;
 std::atomic<bool> g_FreezeRunning(true);
 std::thread g_FreezeThread;
 
-// Kernel status (for driver messages)
+// Kernel status
 ULONG     g_KernelVersion = 0;
 char      g_KernelStatus[256] = "";
 
@@ -306,7 +288,7 @@ void FreezeLoop() {
 void RefreshProcessList()
 {
     g_ProcessList.clear();
-    if (g_hDriver == INVALID_HANDLE_VALUE) return; // kernel only
+    if (g_hDriver == INVALID_HANDLE_VALUE) return;
     typedef NTSTATUS(NTAPI* PFN_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
     HMODULE ntdll = GetModuleHandleA("ntdll.dll"); if (!ntdll) return;
     auto pNtQSI = (PFN_NtQuerySystemInformation)GetProcAddress(ntdll, "NtQuerySystemInformation"); if (!pNtQSI) return;
@@ -324,79 +306,7 @@ void RefreshProcessList()
 }
 
 // =====================================================================
-//  Memory region enumeration & scanning - KERNEL ONLY
-// =====================================================================
-struct RegionInfo { ULONG_PTR Start; ULONG_PTR End; };
-static ULONG_PTR MaxAddr(ULONG_PTR a, ULONG_PTR b) { return a > b ? a : b; }
-static ULONG_PTR MinAddr(ULONG_PTR a, ULONG_PTR b) { return a < b ? a : b; }
-static bool IsReadableProtectKernel(DWORD protect) { return (protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE); }
-static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd) {
-    std::vector<RegionInfo> regions; if (g_hDriver == INVALID_HANDLE_VALUE) return regions;
-    ULONG_PTR cursor = rangeStart & ~(ULONG_PTR)0xFFF; ULONG guard = 0;
-    while (cursor < rangeEnd) {
-        if (++guard > 1 << 22) break; ULONG_PTR length = 0; ULONG protection = 0;
-        if (!DbkQueryVirtualMemory(pid, cursor, &length, &protection)) break; if (length == 0) break;
-        ULONG_PTR base = cursor & ~(ULONG_PTR)0xFFF; ULONG_PTR end = base + length; if (end <= base) break;
-        if (IsReadableProtectKernel(protection)) { ULONG_PTR s = MaxAddr(base, rangeStart); ULONG_PTR e = MinAddr(end, rangeEnd); if (s < e) regions.push_back({s,e}); }
-        cursor = end;
-    }
-    return regions;
-}
-
-void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned)
-{
-    g_IsScanning = true; g_ScanProgress = 0; g_ScanTruncated = false;
-    { std::lock_guard<std::mutex> lock(g_ScanResultsLock); g_ScanResults.clear(); }
-    if (g_hDriver == INVALID_HANDLE_VALUE || targetPid == 0) { g_ScanVersion++; g_IsScanning = false; return; }
-    ULONG sz = GetDataSize(dataType); ULONG_PTR rStart = useRange ? rangeStart : 0x10000; ULONG_PTR rEnd = useRange ? rangeEnd : 0x7FFFFFFFFFFFULL;
-    std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
-    std::vector<ULONG_PTR> results; std::vector<BYTE> chunk(DBK_MAX_IO_SIZE); ULONG64 totalBytes = 0, doneBytes = 0;
-    for (auto& r : regions) totalBytes += (ULONG64)(r.End - r.Start);
-    for (auto& r : regions) {
-        ULONG_PTR cur = r.Start;
-        while (cur < r.End) {
-            ULONG_PTR remaining = r.End - cur; ULONG chunkSize = (ULONG)MinAddr(remaining, (ULONG_PTR)chunk.size());
-            if (DbkReadBytes(targetPid, cur, chunk.data(), chunkSize)) {
-                ULONG maxOff = (chunkSize >= sz) ? (chunkSize - sz + 1) : 0; ULONG step = allowUnaligned ? 1 : sz;
-                for (ULONG off = 0; off < maxOff; off += step) {
-                    if (memcmp(&chunk[off], &searchVal64, sz) == 0) { results.push_back(cur + off); if (results.size() >= MAX_SCAN_RESULTS) { g_ScanTruncated = true; goto scan_done; } }
-                }
-            }
-            cur += chunkSize; doneBytes += chunkSize; g_ScanProgress = totalBytes ? (int)(doneBytes * 100 / totalBytes) : 100;
-        }
-    }
-scan_done:
-    { std::lock_guard<std::mutex> lock(g_ScanResultsLock); g_ScanResults = std::move(results); }
-    g_ScanVersion++; g_ScanProgress = 100; g_IsScanning = false;
-}
-void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults)
-{
-    g_IsScanning = true; g_ScanProgress = 0; g_ScanTruncated = false;
-    if (g_hDriver == INVALID_HANDLE_VALUE || prevResults.empty()) { g_IsScanning = false; return; }
-    ULONG sz = GetDataSize(dataType); std::vector<ULONG_PTR> results; results.reserve(prevResults.size());
-    ULONG64 total = (ULONG64)prevResults.size(), done = 0;
-    for (auto a : prevResults) { ULONG64 v = 0; if (DbkReadBytes(targetPid, a, &v, sz) && memcmp(&v, &searchVal64, sz) == 0) results.push_back(a); done++; g_ScanProgress = total ? (int)(done * 100 / total) : 100; }
-    { std::lock_guard<std::mutex> lock(g_ScanResultsLock); g_ScanResults = std::move(results); }
-    g_ScanVersion++; g_ScanProgress = 100; g_IsScanning = false;
-}
-void StartFirstScan() {
-    if (g_SelectedPid == 0 || g_IsScanning) return; ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType); g_ResultsDataType = g_SelectedDataType;
-    ULONG_PTR rStart = 0x10000; ULONG_PTR rEnd = 0x7FFFFFFFFFFFULL; if (g_UseScanRange) { rStart = (ULONG_PTR)_strtoui64(g_ScanRangeStart, NULL, 0); rEnd = (ULONG_PTR)_strtoui64(g_ScanRangeEnd, NULL, 0); }
-    std::thread(AsyncFirstScanWorker, g_SelectedPid, g_SelectedDataType, val64, g_UseScanRange, rStart, rEnd, g_AllowUnaligned).detach();
-}
-void StartNextScan() {
-    if (g_SelectedPid == 0 || g_IsScanning) return; std::vector<ULONG_PTR> currentCopy; { std::lock_guard<std::mutex> lock(g_ScanResultsLock); currentCopy = g_ScanResults; } if (currentCopy.empty()) return;
-    ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType); g_ResultsDataType = g_SelectedDataType;
-    std::thread(AsyncNextScanWorker, g_SelectedPid, g_SelectedDataType, val64, currentCopy).detach();
-}
-void ExportResultsToFile() {
-    std::vector<ULONG_PTR> copy; { std::lock_guard<std::mutex> lock(g_ScanResultsLock); copy = g_ScanResults; }
-    std::ofstream outFile("ScanResultsExport.txt"); if (!outFile.is_open()) return;
-    for (auto addr : copy) outFile << "0x" << std::hex << addr << "\n"; outFile.close();
-}
-
-// =====================================================================
-//  WinMain - with Memory View (full CE features)
+//  WinMain - Minimal (Memory View & Memory Scanner removed per user request)
 // =====================================================================
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
@@ -424,8 +334,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO(); (void)io; io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOther(window, true); ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
-    MemoryView_Init();
-    MemoryScanner_Init();
     if (driverConnected) { RefreshProcessList(); DbkGetVersion(&g_KernelVersion); }
     g_FreezeThread = std::thread(FreezeLoop);
     int lastWidth = 0, lastHeight = 0; glfwGetFramebufferSize(window, &lastWidth, &lastHeight);
@@ -441,7 +349,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         if (fbWidth == 0 || fbHeight == 0) { Sleep(10); continue; }
         ImGui_ImplDX11_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always); ImGui::SetNextWindowSize(ImVec2((float)fbWidth, (float)fbHeight), ImGuiCond_Always);
-        ImGui::Begin("Imno - DBK64 (Kernel Only)", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
+        ImGui::Begin("Imno - DBK64 (Kernel Only) - Cheat Table Only", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) ImGui::TextColored({0.0f, 1.0f, 0.0f, 1.0f}, "[DBK64 Driver: ACTIVE] [KERNEL MODE]");
@@ -460,8 +368,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     if (g_SelectedPid != p.ProcessId) {
                         g_SelectedPid = p.ProcessId;
                         g_SelectedIs64 = IsTarget64Bit(p.ProcessId);
-                        MemoryView_OnPidChanged(g_SelectedPid, g_SelectedIs64);
-                        MemoryScanner_OnPidChanged(g_SelectedPid, g_SelectedIs64);
                     }
                 }
                 if (isSelected) ImGui::SetItemDefaultFocus();
@@ -471,65 +377,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::SameLine(); if (g_SelectedPid != 0) { ImGui::TextColored({0.0f, 1.0f, 0.0f, 1.0f}, "PID: %u", g_SelectedPid); ImGui::SameLine(); ImGui::TextDisabled("(%s)", g_SelectedIs64 ? "64-bit" : "32-bit"); }
         ImGui::Separator();
 
-        if (ImGui::BeginTabBar("ImnoTabs")) {
-            if (ImGui::BeginTabItem("Memory Scanner [CE Clone]")) {
-                MemoryScanner_Render();
-                ImGui::EndTabItem();
+        // Only Cheat Table now - Memory View and Memory Scanner removed
+        ImGui::Text("Cheat Table (Active Freeze & Patches):");
+        ImGui::BeginChild("CheatTableChild", ImVec2(0, 0), true);
+        {
+            std::lock_guard<std::mutex> lock(g_CheatTableLock);
+            for (int i = 0; i < (int)g_CheatTable.size(); i++) {
+                ImGui::PushID(i); bool isEnabled = g_CheatTable[i].Enabled; if (ImGui::Checkbox("##en", &isEnabled)) g_CheatTable[i].Enabled = isEnabled; ImGui::SameLine();
+                ImGui::Text("0x%llX [PID %u]", g_CheatTable[i].Address, g_CheatTable[i].Pid); ImGui::SameLine(220);
+                char valStr[64]; FormatValueToString(g_CheatTable[i].Value64, g_CheatTable[i].DataType, valStr, sizeof(valStr));
+                ImGui::SetNextItemWidth(140); if (ImGui::InputText("##val", valStr, sizeof(valStr))) g_CheatTable[i].Value64 = ParseInputToValue(valStr, g_CheatTable[i].DataType);
+                ImGui::SameLine(380); ImGui::SetNextItemWidth(180); ImGui::InputText("##desc", g_CheatTable[i].Description, sizeof(g_CheatTable[i].Description));
+                ImGui::SameLine(570); if (ImGui::Button("Remove")) g_CheatTable.erase(g_CheatTable.begin() + i--);
+                ImGui::PopID();
             }
-            if (ImGui::BeginTabItem("Memory Scanner [Legacy]")) {
-                ImGui::Text("Data Type:"); ImGui::SameLine();
-                ImGui::RadioButton("4 Bytes", &g_SelectedDataType, 4); ImGui::SameLine();
-                ImGui::RadioButton("2 Bytes", &g_SelectedDataType, 2); ImGui::SameLine();
-                ImGui::RadioButton("1 Byte", &g_SelectedDataType, 3); ImGui::SameLine();
-                ImGui::RadioButton("Float", &g_SelectedDataType, 1); ImGui::SameLine();
-                ImGui::RadioButton("Double", &g_SelectedDataType, 5); ImGui::SameLine();
-                ImGui::RadioButton("8 Bytes", &g_SelectedDataType, 0);
-                ImGui::Spacing(); ImGui::Text("Scan Value:"); ImGui::SameLine(); ImGui::SetNextItemWidth(200); ImGui::InputText("##scanval", g_ScanValueInput, sizeof(g_ScanValueInput)); ImGui::SameLine();
-                if (!g_IsScanning) {
-                    if (ImGui::Button("First Scan", ImVec2(110, 30))) StartFirstScan(); ImGui::SameLine();
-                    if (ImGui::Button("Next Scan", ImVec2(110, 30))) StartNextScan(); ImGui::SameLine();
-                    if (ImGui::Button("Export Results", ImVec2(120, 30))) ExportResultsToFile();
-                } else ImGui::TextDisabled("Scanning in progress...");
-                ImGui::Checkbox("Unaligned Scan (slower)", &g_AllowUnaligned); ImGui::SameLine(); ImGui::Checkbox("Scan Range", &g_UseScanRange);
-                if (g_UseScanRange) { ImGui::SetNextItemWidth(140); ImGui::InputText("Start", g_ScanRangeStart, sizeof(g_ScanRangeStart)); ImGui::SameLine(); ImGui::SetNextItemWidth(140); ImGui::InputText("End", g_ScanRangeEnd, sizeof(g_ScanRangeEnd)); }
-                if (g_IsScanning) ImGui::ProgressBar((float)g_ScanProgress / 100.0f, ImVec2(-1, 0), "Scanning Process Memory (kernel reads)...");
-                ImGui::Spacing(); ImGui::Separator();
-                static std::vector<ULONG_PTR> s_DisplayAddrs; static std::vector<ULONG64> s_DisplayVals; static unsigned s_DisplayVersion = 0xFFFFFFFF; static bool s_NeedValueRefresh = true; static ULONGLONG s_LastValueRefresh = 0;
-                if (!g_IsScanning && s_DisplayVersion != g_ScanVersion) { std::lock_guard<std::mutex> lock(g_ScanResultsLock); s_DisplayAddrs = g_ScanResults; s_DisplayVersion = g_ScanVersion; s_DisplayVals.assign(s_DisplayAddrs.size(), 0); s_NeedValueRefresh = true; }
-                ImGui::Text("Scan Results Found: %zu", s_DisplayAddrs.size());
-                if (!g_IsScanning && g_ScanTruncated) ImGui::TextColored({1.0f, 0.6f, 0.0f, 1.0f}, "Results truncated at %d - use Next Scan or a narrower range!", MAX_SCAN_RESULTS);
-                ImGui::BeginChild("ResultsChild", ImVec2(0, 350), true);
-                {
-                    bool doRefresh = !g_IsScanning && (s_NeedValueRefresh || (GetTickCount64() - s_LastValueRefresh > 400));
-                    ImGuiListClipper clipper; clipper.Begin((int)s_DisplayAddrs.size());
-                    while (clipper.Step()) { for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) { if (doRefresh) ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType); char valStr[64]; FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr)); char label[160]; sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i); if (ImGui::Selectable(label)) { std::lock_guard<std::mutex> lock(g_CheatTableLock); char desc[64]; sprintf_s(desc, sizeof(desc), "0x%llX", s_DisplayAddrs[i]); g_CheatTable.push_back({s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, ""}); strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc); } } }
-                    if (doRefresh) { s_LastValueRefresh = GetTickCount64(); s_NeedValueRefresh = false; }
-                }
-                ImGui::EndChild(); ImGui::EndTabItem();
+            if (g_CheatTable.empty()) {
+                ImGui::TextDisabled("No entries. Memory View and Memory Scanner have been removed per request.");
+                ImGui::TextDisabled("Add entries manually or via future modules.");
             }
-            if (ImGui::BeginTabItem("Cheat Table")) {
-                ImGui::Text("Cheat Table (Active Freeze & Patches):");
-                ImGui::BeginChild("CheatTableChild", ImVec2(0, 300), true);
-                {
-                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                    for (int i = 0; i < (int)g_CheatTable.size(); i++) {
-                        ImGui::PushID(i); bool isEnabled = g_CheatTable[i].Enabled; if (ImGui::Checkbox("##en", &isEnabled)) g_CheatTable[i].Enabled = isEnabled; ImGui::SameLine();
-                        ImGui::Text("0x%llX [PID %u]", g_CheatTable[i].Address, g_CheatTable[i].Pid); ImGui::SameLine(220);
-                        char valStr[64]; FormatValueToString(g_CheatTable[i].Value64, g_CheatTable[i].DataType, valStr, sizeof(valStr));
-                        ImGui::SetNextItemWidth(140); if (ImGui::InputText("##val", valStr, sizeof(valStr))) g_CheatTable[i].Value64 = ParseInputToValue(valStr, g_CheatTable[i].DataType);
-                        ImGui::SameLine(380); ImGui::SetNextItemWidth(180); ImGui::InputText("##desc", g_CheatTable[i].Description, sizeof(g_CheatTable[i].Description));
-                        ImGui::SameLine(570); if (ImGui::Button("Remove")) g_CheatTable.erase(g_CheatTable.begin() + i--);
-                        ImGui::PopID();
-                    }
-                }
-                ImGui::EndChild(); ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Memory View [CE Full]")) {
-                MemoryView_Render();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
         }
+        ImGui::EndChild();
+
         ImGui::End();
         ImGui::Render();
         const float clear_color[4] = {0.08f, 0.08f, 0.10f, 1.00f};
@@ -539,8 +407,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         pSwapChain->Present(1, 0);
     }
     g_FreezeRunning = false; if (g_FreezeThread.joinable()) g_FreezeThread.join();
-    MemoryScanner_Shutdown();
-    MemoryView_Shutdown();
     ImGui_ImplDX11_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
     if (mainRenderTargetView) mainRenderTargetView->Release(); if (pSwapChain) pSwapChain->Release(); if (pd3dDeviceContext) pd3dDeviceContext->Release(); if (pd3dDevice) pd3dDevice->Release();
     glfwDestroyWindow(window); glfwTerminate();
