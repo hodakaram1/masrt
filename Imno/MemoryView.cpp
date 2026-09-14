@@ -872,7 +872,7 @@ void MemoryView_Render() {
             float hexH = availH * 0.40f - 10;
 
             // Disasm child
-            ImGui::BeginChild("DisasmChild", ImVec2(0, disasmH), true);
+            ImGui::BeginChild("DisasmChild", ImVec2(0.0f, disasmH), true);
             if (g_MemView.disasmNeedsRefresh) MemoryView_RefreshDisasm();
 
             // Header
@@ -888,7 +888,7 @@ void MemoryView_Render() {
             ImGui::EndChild();
 
             // Hex child
-            ImGui::BeginChild("HexChild", ImVec2(0, hexH), true);
+            ImGui::BeginChild("HexChild", ImVec2(0.0f, hexH), true);
             // Hex controls
             ImGui::SetNextItemWidth(200);
             if (ImGui::InputText("Hex Addr", g_MemView.hexAddrInput, sizeof(g_MemView.hexAddrInput), ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -927,7 +927,7 @@ void MemoryView_Render() {
                         bool selected = (g_MemView.hexSelectedOffset == idx);
                         char label[8]; sprintf_s(label, "%02X", b);
                         if (selected) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 0, 1));
-                        if (ImGui::Selectable(label, selected, 0, ImVec2(24, 0))) {
+                        if (ImGui::Selectable(label, selected, 0, ImVec2(24.0f, 0.0f))) {
                             g_MemView.hexSelectedOffset = idx;
                             sprintf_s(g_MemView.hexEditInput, "%02X", b);
                             g_MemView.hexEditActive = true;
@@ -1042,7 +1042,7 @@ void MemoryView_Render() {
             ImGui::SameLine();
             ImGui::TextDisabled("%zu regions", g_MemView.regions.size());
 
-            ImGui::BeginChild("RegionsChild", ImVec2(0, 0), true);
+            ImGui::BeginChild("RegionsChild", ImVec2(0.0f, 0.0f), true);
             ImGui::Columns(5, "regionsCols");
             ImGui::Text("Base"); ImGui::NextColumn();
             ImGui::Text("Size"); ImGui::NextColumn();
@@ -1091,7 +1091,7 @@ void MemoryView_Render() {
             ImGui::SameLine();
             ImGui::TextDisabled("%zu modules", g_MemView.modules.size());
 
-            ImGui::BeginChild("ModulesChild", ImVec2(0, 0), true);
+            ImGui::BeginChild("ModulesChild", ImVec2(0.0f, 0.0f), true);
             ImGui::Columns(4, "modulesCols");
             ImGui::Text("Name"); ImGui::NextColumn();
             ImGui::Text("Base"); ImGui::NextColumn();
@@ -1137,7 +1137,7 @@ void MemoryView_Render() {
                 ImGui::TextDisabled("No strings scanned yet. Click Scan Strings.");
             }
 
-            ImGui::BeginChild("StringsChild", ImVec2(0, 0), true);
+            ImGui::BeginChild("StringsChild", ImVec2(0.0f, 0.0f), true);
             ImGuiListClipper clipper;
             clipper.Begin((int)g_MemView.strings.size());
             while (clipper.Step()) {
@@ -1172,7 +1172,7 @@ void MemoryView_Render() {
             ImGui::Text("Bookmarks: %zu", g_MemView.bookmarks.size());
             ImGui::SameLine();
             if (ImGui::Button("Clear All")) g_MemView.bookmarks.clear();
-            ImGui::BeginChild("BookmarksChild", ImVec2(0, 0), true);
+            ImGui::BeginChild("BookmarksChild", ImVec2(0.0f, 0.0f), true);
             for (size_t i = 0; i < g_MemView.bookmarks.size(); i++) {
                 auto& bm = g_MemView.bookmarks[i];
                 ImGui::PushID((int)i);
@@ -1226,11 +1226,11 @@ void MemoryView_Render() {
             if (g_MemView.isSearching) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("Searching... %d%%", g_MemView.searchProgress);
-                ImGui::ProgressBar((float)g_MemView.searchProgress / 100.0f, ImVec2(200, 0));
+                ImGui::ProgressBar((float)g_MemView.searchProgress / 100.0f, ImVec2(200.0f, 0.0f));
             } else {
                 if (!g_MemView.searchResults.empty()) {
                     ImGui::Text("Found %zu results:", g_MemView.searchResults.size());
-                    ImGui::BeginChild("SearchResultsChild", ImVec2(0, 150), true);
+                    ImGui::BeginChild("SearchResultsChild", ImVec2(0.0f, 150.0f), true);
                     ImGuiListClipper clipper;
                     clipper.Begin((int)g_MemView.searchResults.size());
                     while (clipper.Step()) {
@@ -1251,7 +1251,7 @@ void MemoryView_Render() {
             if (ImGui::Button("List CALLs in view")) {
                 // Already have disasmLines, just filter
             }
-            ImGui::BeginChild("CallsChild", ImVec2(0, 150), true);
+            ImGui::BeginChild("CallsChild", ImVec2(0.0f, 150.0f), true);
             for (auto& line : g_MemView.disasmLines) {
                 if (line.isCall && line.hasBranchTarget) {
                     char buf[256];
