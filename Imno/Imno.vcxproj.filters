@@ -27,12 +27,18 @@
     <ClInclude Include="Imno.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="MemoryScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="MemoryView.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Imno.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MemoryScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="MemoryView.cpp">
