@@ -24,29 +24,16 @@
 #include "imgui_impl_dx11.h"
 #include "Resource.h"
 
-// Zydis (vendored in third_party/) for instruction decoding.
-#include <Zydis/Zydis.h>
-
 // =====================================================================
 //  DBK64 Kernel Driver Configuration
-//
-//  The DBK64 driver (Cheat Engine's DBKKernel) reads four registry
-//  values from its own service key when DriverEntry runs:
-//      A  -> device object name     (IoCreateDevice)
-//      B  -> symbolic link name     (IoCreateSymbolicLink)  -> "\\\\.\\..."
-//      C  -> process-event name     (process watch)
-//      D  -> thread-event name      (thread watch)
-//
-//  The values below are written by LoadAndStartDriver() and MUST match
-//  the name this GUI opens with ConnectDriver().
 // =====================================================================
 #define DBK_SERVICE_NAME     L"DBK64"
 #define DBK_SERVICE_REG_KEY  L"SYSTEM\\CurrentControlSet\\Services\\DBK64"
-#define DBK_DEVICE_NAME      L"\\Device\\DBK64"            // registry value "A"
-#define DBK_SYMLINK_NAME     L"\\DosDevices\\DBK64"        // registry value "B"
-#define DBK_PROCESS_EVENT    L"\\BaseNamedObjects\\DBKProcList"   // registry value "C"
-#define DBK_THREAD_EVENT     L"\\BaseNamedObjects\\DBKThreadList" // registry value "D"
-#define DBK_DEVICE_PATH      L"\\\\.\\DBK64"               // user-mode open path
+#define DBK_DEVICE_NAME      L"\\Device\\DBK64"
+#define DBK_SYMLINK_NAME     L"\\DosDevices\\DBK64"
+#define DBK_PROCESS_EVENT    L"\\BaseNamedObjects\\DBKProcList"
+#define DBK_THREAD_EVENT     L"\\BaseNamedObjects\\DBKThreadList"
+#define DBK_DEVICE_PATH      L"\\\\.\\DBK64"
 #define DBK_DRIVER_FILE      L"DBK64.sys"
 
 #define DBK_VERSION_EXPECTED 2000027
@@ -69,6 +56,8 @@
 #define IOCTL_CE_GETVERSION           CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0816, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_GETCR4               CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0817, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_ALLOCATEMEM          CTL_CODE(IOCTL_UNKNOWN_BASE, 0x081f, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_SUSPENDTHREAD        CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0822, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_RESUMETHREAD         CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0823, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_SUSPENDPROCESS       CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0824, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_RESUMEPROCESS        CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0825, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_ALLOCATEMEM_NONPAGED CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0826, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
@@ -77,26 +66,26 @@
 #define IOCTL_CE_READMSR              CTL_CODE(IOCTL_UNKNOWN_BASE, 0x083f, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_WRITEMSR             CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0840, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_FREE_NONPAGED        CTL_CODE(IOCTL_UNKNOWN_BASE, 0x084c, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_GET_PEB              CTL_CODE(IOCTL_UNKNOWN_BASE, 0x085d, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_QUERYINFORMATIONPROCESS CTL_CODE(IOCTL_UNKNOWN_BASE, 0x085e, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
-// Maximum addresses kept from a first scan (scanner reports truncation past this)
 #define MAX_SCAN_RESULTS 200000
 
 // =====================================================================
-//  DBK64 Request / Response structures (byte-exact for the driver)
+//  DBK64 Request / Response structures
 // =====================================================================
 #pragma pack(push, 1)
 typedef struct _DBK_READ_REQUEST {
-    ULONG64 ProcessId;      // offset 0
-    ULONG64 Address;        // offset 8
-    USHORT  BytesToRead;    // offset 16
+    ULONG64 ProcessId;
+    ULONG64 Address;
+    USHORT  BytesToRead;
 } DBK_READ_REQUEST, *PDBK_READ_REQUEST;
 
 typedef struct _DBK_WRITE_HEADER {
-    ULONG64 ProcessId;      // offset 0
-    ULONG64 Address;        // offset 8
-    USHORT  BytesToWrite;   // offset 16  (driver pads this struct to 24 bytes)
+    ULONG64 ProcessId;
+    ULONG64 Address;
+    USHORT  BytesToWrite;
 } DBK_WRITE_HEADER, *PDBK_WRITE_HEADER;
-// The driver's "sizeof(struct input)" == 24 (default alignment). Data follows at +24.
 #define DBK_WRITE_HEADER_SIZE 24
 
 typedef struct _DBK_PHYS_RW {
@@ -128,13 +117,6 @@ typedef struct _DBK_VA_TO_PA {
 } DBK_VA_TO_PA, *PDBK_VA_TO_PA;
 #pragma pack(pop)
 
-// IOCTL_CE_QUERY_VIRTUAL_MEMORY (0x0803):
-//   input  { UINT64 ProcessId; UINT64 StartAddress; }
-//   output { UINT64 Length; ULONG Protection; }   (same buffer, returned in place)
-// Length is the byte count from StartAddress (page-aligned down) until the
-// page-table state changes; Protection is PAGE_EXECUTE_READWRITE / PAGE_EXECUTE_READ
-// / PAGE_NOACCESS. Enumerated fully from the kernel, so it works on protected
-// processes and 32-bit targets that user-mode VirtualQueryEx cannot open.
 #pragma pack(push, 1)
 typedef struct _DBK_QUERY_VMEM {
     ULONG64 ProcessId;
@@ -146,8 +128,6 @@ typedef struct _DBK_QUERY_VMEM_OUT {
     ULONG   Protection;
 } DBK_QUERY_VMEM_OUT, *PDBK_QUERY_VMEM_OUT;
 
-// Input/output share one buffered buffer (in-place): the driver overwrites
-// the 16-byte input header with the 12-byte output.
 typedef struct _DBK_QUERY_VMEM_INOUT {
     union {
         DBK_QUERY_VMEM     In;
@@ -156,10 +136,8 @@ typedef struct _DBK_QUERY_VMEM_INOUT {
 } DBK_QUERY_VMEM_INOUT, *PDBK_QUERY_VMEM_INOUT;
 #pragma pack(pop)
 
-// Max bytes the driver can read/write in one IOCTL (WORD size field).
 #define DBK_MAX_IO_SIZE 0xFFFF
 
-// IDT / GDT are returned by the driver as: WORD limit (offset 0) + pointer (offset 2)
 #pragma pack(push, 2)
 typedef struct _DBK_SEG_TABLE {
     USHORT     Limit;
@@ -191,8 +169,8 @@ struct CheatItem {
     ULONG_PTR Address;
     ULONG64   Value64;
     bool      Enabled;
-    int       DataType;   // size/type captured when the item was added
-    ULONG     Pid;        // process captured when the item was added
+    int       DataType;
+    ULONG     Pid;
     char      Description[64];
 };
 
@@ -213,56 +191,35 @@ bool DbkReadBytes(ULONG pid, ULONG_PTR addr, void* out, ULONG size);
 bool DbkWriteBytes(ULONG pid, ULONG_PTR addr, const void* in, ULONG size);
 
 // =====================================================================
-//  Memory & Patch Operations
+//  Memory Operations - simplified
 // =====================================================================
 ULONG GetDataSize(int dataType);
 void WriteMemory(ULONG pid, ULONG_PTR addr, ULONG64 val64, int dataType);
 void ReadMemory(ULONG pid, ULONG_PTR addr, ULONG64* outVal, int dataType);
-void PatchMemory(ULONG_PTR addr, const UCHAR* pattern, ULONG size);
-
-// Process bitness / pointer size (32-bit targets use 4-byte pointers)
 bool IsTarget64Bit(ULONG pid);
-ULONG GetPointerSize(ULONG pid);
-// Parses "module.exe+0x123", "module.exe-0x10" or a raw "0x..." / decimal address.
-ULONG_PTR ParseAddressInput(const char* str);
-
 ULONG64 ParseInputToValue(const char* str, int dataType);
 void FormatValueToString(ULONG64 val64, int dataType, char* outBuf, size_t maxLen);
-ULONG_PTR ResolvePointerPath(ULONG pid, ULONG_PTR baseAddress, const std::vector<LONG>& offsets);
-struct ResolvedPointer;
-ResolvedPointer ResolvePointerSmart(ULONG pid, const char* addressInput, const char* offsetsInput);
-std::string GetAutoOffsetForAddress(ULONG_PTR targetAddr);
-std::string GetZydisDisassembledBytes(ULONG_PTR targetAddr, ULONG instructionCount);
 
 // =====================================================================
-//  DBK64 feature helpers (Kernel tab)
+//  DBK64 core helpers - only what Scanner needs
 // =====================================================================
 bool DbkGetVersion(ULONG* version);
-bool DbkGetCR0(ULONG64* out);
-bool DbkGetCR3(ULONG pid, ULONG64* out);
-bool DbkGetCR4(ULONG64* out);
-bool DbkReadMsr(ULONG msr, ULONG64* out);
-bool DbkWriteMsr(ULONG64 msr, ULONG64 value);
-bool DbkGetIdt(USHORT* limit, ULONG_PTR* base);
-bool DbkGetGdt(USHORT* limit, ULONG_PTR* base);
-bool DbkReadPhysical(ULONG64 addr, void* out, ULONG size);
-bool DbkWritePhysical(ULONG64 addr, const void* in, ULONG size);
-bool DbkAllocNonPaged(ULONG size, ULONG64* out);
-bool DbkFreeNonPaged(ULONG64 addr);
 bool DbkAllocProcessMem(ULONG pid, ULONG64 size, ULONG64* out);
 bool DbkSuspendProcess(ULONG pid);
 bool DbkResumeProcess(ULONG pid);
+bool DbkSuspendThread(ULONG tid);
+bool DbkResumeThread(ULONG tid);
 bool DbkOpenProcessHandle(ULONG pid, ULONG64* handle, UCHAR* special);
 bool DbkGetPEPROCESS(ULONG pid, ULONG64* out);
+bool DbkGetPeb(ULONG64 peprocess, ULONG64* outPeb);
+bool DbkGetWow64Peb(ULONG pid, ULONG64* outWow64Peb);
 bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
 // =====================================================================
-//  Workers / UI
+//  Workers / UI - simplified (only Memory Scanner, Cheat Table)
 // =====================================================================
 void FreezeLoop();
 void RefreshProcessList();
-void RefreshModules();
-
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned);
 void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults);
 void StartFirstScan();

@@ -1,8 +1,8 @@
 # Masiam — Imno GUI + DBKKernel driver
 
-`Imno` is a native Windows GUI memory tool (scanner, cheat table, byte patcher,
-pointer resolver, and a DBK64 kernel feature tab) backed by the `DBKKernel`
-(DBK64) kernel driver — the Cheat Engine-style kernel driver.
+`Imno` is a native Windows GUI memory tool (scanner + cheat table) backed by the
+`DBKKernel` (DBK64) kernel driver — the Cheat Engine-style kernel driver.
+Kernel-only operation, no user-mode OpenProcess fallback.
 
 - `Imno/` — the user-mode GUI (`Imno.cpp` / `Imno.h`). Talks to the driver over
   the `IOCTL_CE_*` device-control interface (byte-identical to
@@ -13,10 +13,6 @@ pointer resolver, and a DBK64 kernel feature tab) backed by the `DBKKernel`
   - **Dear ImGui** `v1.90.9`
   - **GLFW** `3.3.9`
   - **Zydis** `v4.1.0` + **Zycore** `v1.5.0`
-- `Imno/CEServer.cpp` / `Imno/CEServer.h` — a **CEServer bridge**: Imno speaks
-  Cheat Engine's `CEServer` TCP protocol so a real Cheat Engine can connect
-  over the network and use Imno + DBK64 as its memory backend (works on
-  protected processes and 32-bit targets).
 - `King.sln` — solution that builds `DBKKernel` then `Imno` (Imno depends on
   DBKKernel). `build.bat` builds the Release x64 configuration (default) and
   logs errors to `build_error.log`. The driver's Release config builds
@@ -85,32 +81,6 @@ or open `King.sln` in Visual Studio, set **Release | x64**, and build.
 
 > The steps in 2–4 are one-time machine setup. With test mode enabled and
 > Secure Boot/HVCI off, the test-signed driver loads every time afterwards.
-
-## Using Cheat Engine with Imno (CoServer tab)
-
-Imno can act as a Cheat Engine `CEServer` (the same protocol CE's own remote
-server uses). Run `Imno.exe` on the target machine, open the **CoServer** tab,
-press **Start Server** (default port `52736`), then on your Cheat Engine side:
-
-1. Open the **Process List** → **Network**.
-2. Enter the target machine's IP and the port shown in Imno, and connect.
-3. The process list now comes from Imno; scanning, reading and writing memory
-   all go through **DBK64**, so protected processes and 32-bit games work even
-   when Cheat Engine's own driver would be blocked.
-
-The bridge exposes the memory API surface Cheat Engine uses: process/module/
-thread enumeration, open process, read/write, region query, allocation and
-memory-protection change. Debugging, injection and speedhack are not supported
-and are reported as failures that Cheat Engine tolerates.
-
-The **Log** panel in the CoServer tab shows every command the client sends and
-the handle each snapshot returns. If Cheat Engine reports
-`I can't get the process list`, run the protocol self-test while the server is
-running (it replays Cheat Engine's exact process-list handshake):
-
-```sh
-python tools/ceserver_selftest.py 127.0.0.1 52736
-```
 
 ## Notes
 
