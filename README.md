@@ -1,12 +1,13 @@
 # Masiam — Imno GUI + DBKKernel driver
 
-`Imno` is a native Windows GUI memory tool (scanner + cheat table) backed by the
+`Imno` is a native Windows GUI memory tool (scanner + cheat table + **full Memory View**) backed by the
 `DBKKernel` (DBK64) kernel driver — the Cheat Engine-style kernel driver.
 Kernel-only operation, no user-mode OpenProcess fallback.
 
-- `Imno/` — the user-mode GUI (`Imno.cpp` / `Imno.h`). Talks to the driver over
+- `Imno/` — the user-mode GUI (`Imno.cpp` / `Imno.h` + `MemoryView.h/cpp`). Talks to the driver over
   the `IOCTL_CE_*` device-control interface (byte-identical to
-  `DBKKernel/IOPLDispatcher.h`).
+  `DBKKernel/IOPLDispatcher.h`). Includes a **full Memory Viewer** extracted from Cheat Engine:
+  disassembler (Zydis), hex editor, regions, modules, strings, AOB search, bookmarks, allocate, assemble (NOP/RET), etc.
 - `DBKKernel/` — the kernel driver, built as `DBK64.sys` (x64) / `DBK32.sys` (x86).
 - `third_party/` — vendored, pinned third-party sources compiled directly into
   the GUI (no vcpkg or external package manager required):
@@ -82,10 +83,28 @@ or open `King.sln` in Visual Studio, set **Release | x64**, and build.
 > The steps in 2–4 are one-time machine setup. With test mode enabled and
 > Secure Boot/HVCI off, the test-signed driver loads every time afterwards.
 
+## Memory View (Full CE Features)
+
+Extracted from Cheat Engine's `MemoryBrowserFormUnit.pas` / `hexviewunit.pas` / `disassemblerviewunit.pas`:
+
+- **Disassembler**: Zydis x86/x64, 80 lines, shows address / bytes / mnemonic, branch targets, module+offset symbols, follow JMP/CALL on double-click, history Back/Forward, Go to `module+offset` (e.g. `conquer.exe+0x1234`), copy address/bytes/disassembly, NOP, assemble (nop/ret/int3 or raw hex), bookmark, add to cheat table, show in hex.
+- **Hex View**: 4KB aligned buffer, 16 bytes/row, address / hex / ASCII, click to select/edit (writes via `DbkWriteBytes`), data interpreter (Int8/16/32/64, Float, Double), context menu copy/edit/go to disasm.
+- **Memory Regions**: full enumeration via `DbkQueryVirtualMemory`, shows base/size/protect (R/RW/RX/RWX), filter, Go/Hex.
+- **Modules**: ToolHelp32 + kernel PEB walk (`DbkGetPEPROCESS` + `DbkGetPeb` + LDR list), shows name/base/size/path, Go to base, supports 32-bit WOW64 PEB.
+- **Referenced Strings**: scans readable regions for printable ASCII strings (min length configurable), filter, Go to.
+- **Bookmarks**: unlimited, add from disasm context, quick jump, clear all.
+- **Tools**:
+  - Allocate memory via `DbkAllocProcessMem` (VirtualAllocEx kernel), shows address, Go to.
+  - AOB/Pattern search with wildcards `?` / `??` (e.g. `48 8B 05 ? ? ? ?`), scans all readable regions, 10k result limit, progress.
+  - Dissect code: lists all CALLs with targets in current view.
+  - Assemble: simple encoder for `nop`, `ret`, `int3` or raw hex bytes (Zydis encoder can be extended to full Keystone later).
+
+All memory reads/writes go through DBK64 driver, so protected 32-bit games like `conquer.exe` work.
+
 ## Notes
 
-- The scanner enumerates memory regions **through the driver**
-  (`IOCTL_CE_QUERY_VIRTUAL_MEMORY`), so it works on protected processes
+- The scanner & memory view enumerate memory regions **through the driver**
+  (`IOCTL_CE_QUERY_VIRTUAL_MEMORY`), so they work on protected processes
   (e.g. `svchost`/PPL) and on guarded 32-bit games. Pointers for 32-bit targets
   are resolved as 4-byte pointers automatically.
 - The driver's Release configuration is built **without** `TOBESIGNED` (the

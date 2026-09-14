@@ -1,4 +1,5 @@
 #include "Imno.h"
+#include "MemoryView.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -394,7 +395,7 @@ void ExportResultsToFile() {
 }
 
 // =====================================================================
-//  WinMain - simplified to 2 tabs only (Memory Scanner, Cheat Table)
+//  WinMain - with Memory View (full CE features)
 // =====================================================================
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
@@ -422,6 +423,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO(); (void)io; io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOther(window, true); ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
+    MemoryView_Init();
     if (driverConnected) { RefreshProcessList(); DbkGetVersion(&g_KernelVersion); }
     g_FreezeThread = std::thread(FreezeLoop);
     int lastWidth = 0, lastHeight = 0; glfwGetFramebufferSize(window, &lastWidth, &lastHeight);
@@ -452,7 +454,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 if (g_ProcessFilter[0] != '\0' && strstr(p.Name, g_ProcessFilter) == NULL) continue;
                 char label[128]; sprintf_s(label, sizeof(label), "%s (%u)", p.Name, p.ProcessId);
                 bool isSelected = (g_SelectedPid == p.ProcessId);
-                if (ImGui::Selectable(label, isSelected)) { g_SelectedPid = p.ProcessId; g_SelectedIs64 = IsTarget64Bit(p.ProcessId); }
+                if (ImGui::Selectable(label, isSelected)) {
+                    if (g_SelectedPid != p.ProcessId) {
+                        g_SelectedPid = p.ProcessId;
+                        g_SelectedIs64 = IsTarget64Bit(p.ProcessId);
+                        MemoryView_OnPidChanged(g_SelectedPid, g_SelectedIs64);
+                    }
+                }
                 if (isSelected) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
@@ -509,6 +517,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 }
                 ImGui::EndChild(); ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Memory View [CE Full]")) {
+                MemoryView_Render();
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
         ImGui::End();
@@ -520,6 +532,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         pSwapChain->Present(1, 0);
     }
     g_FreezeRunning = false; if (g_FreezeThread.joinable()) g_FreezeThread.join();
+    MemoryView_Shutdown();
     ImGui_ImplDX11_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
     if (mainRenderTargetView) mainRenderTargetView->Release(); if (pSwapChain) pSwapChain->Release(); if (pd3dDeviceContext) pd3dDeviceContext->Release(); if (pd3dDevice) pd3dDevice->Release();
     glfwDestroyWindow(window); glfwTerminate();

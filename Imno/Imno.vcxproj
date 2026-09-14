@@ -149,11 +149,13 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="Imno.h" />
+    <ClInclude Include="MemoryView.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Imno.cpp" />
+    <ClCompile Include="MemoryView.cpp" />
     <!-- Dear ImGui -->
     <ClCompile Include="..\third_party\imgui\imgui.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_draw.cpp" />
