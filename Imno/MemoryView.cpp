@@ -742,8 +742,7 @@ static void RenderDisasmLine(const DisasmLine& line, int idx, bool isSelected) {
         if (ImGui::MenuItem("Add to Cheat Table")) {
             std::lock_guard<std::mutex> lock(g_CheatTableLock);
             char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)line.address);
-            g_CheatTable.push_back({line.address, 0, false, 4, g_SelectedPid, ""});
-            strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc);
+            CheatItem ni{}; ni.Address = line.address; ni.BaseAddress = line.address; ni.RealAddress = line.address; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
         }
         if (ImGui::MenuItem("NOP this instruction")) {
             std::vector<BYTE> nops(line.length, 0x90);
@@ -954,8 +953,7 @@ void MemoryView_Render() {
                             if (ImGui::MenuItem("Add to Cheat Table")) {
                                 std::lock_guard<std::mutex> lock(g_CheatTableLock);
                                 char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)(rowAddr + c));
-                                g_CheatTable.push_back({rowAddr + c, b, false, 3, g_SelectedPid, ""});
-                                strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc);
+                                CheatItem ni{}; ni.Address = rowAddr + c; ni.BaseAddress = rowAddr + c; ni.RealAddress = rowAddr + c; ni.Value64 = b; ni.Enabled = false; ni.DataType = 3; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); FormatValueToString(ni.Value64, ni.DataType, ni.FrozenValueStr, sizeof(ni.FrozenValueStr)); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
                             }
                             ImGui::EndPopup();
                         }

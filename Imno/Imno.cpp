@@ -1,9 +1,9 @@
 #include "Imno.h"
 #include "MemoryView.h"
-#include "Version.h"
 
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
 
 // Direct Link Libraries for D3D11 & DXGI
 #pragma comment(lib, "d3d11.lib")
@@ -288,13 +288,199 @@ bool IsTarget64Bit(ULONG pid) {
 }
 
 // =====================================================================
-//  Freeze Loop
+//  CE Freeze System - Full Clone from MemoryRecordUnit.pas
+//  TFreezeType: ftFrozen, ftAllowIncrease, ftAllowDecrease
+//  TMemoryRecord.ApplyFreeze logic
 // =====================================================================
+bool ResolvePointerAddress(ULONG pid, ULONG_PTR base, const std::vector<int>& offsets, bool is64, ULONG_PTR* outReal) {
+    if (!outReal) return false;
+    *outReal = 0;
+    if (pid == 0 || base == 0) return false;
+    if (g_hDriver == INVALID_HANDLE_VALUE) return false;
+
+    ULONG_PTR cur = base;
+    // Walk pointer chain: for each offset except last, read pointer then add offset
+    // CE logic: RealAddress = base; for i=0 to offsets.Count-1: read [RealAddress] then RealAddress = readValue + offset[i]
+    // If offsets empty, RealAddress = base
+
+    if (offsets.empty()) {
+        *outReal = base;
+        return true;
+    }
+
+    for (size_t i = 0; i < offsets.size(); i++) {
+        ULONG_PTR next = 0;
+        if (is64) {
+            ULONG64 v64 = 0;
+            if (!DbkReadBytes(pid, cur, &v64, sizeof(v64))) return false;
+            next = (ULONG_PTR)v64;
+        } else {
+            ULONG v32 = 0;
+            if (!DbkReadBytes(pid, cur, &v32, sizeof(v32))) return false;
+            next = (ULONG_PTR)v32;
+        }
+        if (next == 0) return false; // unreadable pointer
+        cur = next + (ULONG_PTR)offsets[i];
+    }
+    *outReal = cur;
+    return true;
+}
+
+bool GetRealAddressForItem(CheatItem& item, bool is64, ULONG_PTR* outAddr) {
+    if (!outAddr) return false;
+    ULONGLONG now = GetTickCount64();
+    // CE: OnlyUpdateAfterInterval logic - re-resolve pointer every UpdateInterval ms
+    bool needResolve = true;
+    if (item.IsPointer) {
+        if (item.LastUpdateTick != 0 && (now - item.LastUpdateTick) < item.UpdateInterval) {
+            // Use cached RealAddress if valid
+            if (item.RealAddress != 0) {
+                *outAddr = item.RealAddress;
+                return true;
+            }
+        }
+        needResolve = true;
+    } else {
+        *outAddr = item.Address;
+        item.RealAddress = item.Address;
+        return true;
+    }
+
+    if (needResolve && item.IsPointer) {
+        ULONG_PTR real = 0;
+        ULONG_PTR base = item.BaseAddress != 0 ? item.BaseAddress : item.Address;
+        if (ResolvePointerAddress(item.Pid, base, item.Offsets, is64, &real)) {
+            item.RealAddress = real;
+            item.BaseAddressResolved = base;
+            item.LastUpdateTick = now;
+            *outAddr = real;
+            return true;
+        } else {
+            // Failed to resolve
+            return false;
+        }
+    }
+    return false;
+}
+
+void ApplyFreezeForItem(CheatItem& item, bool is64) {
+    // Clone of TMemoryRecord.ApplyFreeze
+    // - If not active (Enabled false) -> do nothing
+    // - Resolve real address (pointer support)
+    // - Read current value from memory
+    // - Depending on FreezeType:
+    //   ftFrozen: always write frozen value
+    //   ftAllowIncrease: only write if current < frozen (allow increase, block decrease)
+    //   ftAllowDecrease: only write if current > frozen (allow decrease, block increase)
+
+    if (!item.Enabled) return;
+    if (item.Pid == 0) return;
+    if (g_hDriver == INVALID_HANDLE_VALUE) return;
+
+    ULONG_PTR realAddr = 0;
+    if (!GetRealAddressForItem(item, is64, &realAddr)) {
+        // Could not resolve pointer, skip
+        return;
+    }
+
+    // For AllowIncrease/Decrease we need to read current value
+    bool needRead = (item.FreezeType != CEFreezeType::Frozen);
+
+    ULONG64 currentVal = 0;
+    float currentFloat = 0.0f;
+    double currentDouble = 0.0;
+    bool hasCurrent = false;
+
+    if (needRead) {
+        // Read current memory
+        ULONG64 v = 0;
+        ULONG sz = GetDataSize(item.DataType);
+        if (DbkReadBytes(item.Pid, realAddr, &v, sz)) {
+            currentVal = v;
+            hasCurrent = true;
+            if (item.DataType == 1) { // float
+                ULONG tmp = (ULONG)v;
+                memcpy(&currentFloat, &tmp, sizeof(float));
+            } else if (item.DataType == 5) { // double
+                memcpy(&currentDouble, &v, sizeof(double));
+            }
+            item.LastSeenValue = v;
+        } else {
+            // Can't read, still try to write for ftFrozen? For allow modes, skip
+            if (item.FreezeType != CEFreezeType::Frozen) return;
+        }
+    }
+
+    bool shouldWrite = false;
+
+    switch (item.FreezeType) {
+        case CEFreezeType::Frozen:
+            shouldWrite = true;
+            break;
+        case CEFreezeType::AllowIncrease: {
+            // Allow increase: if current < frozen, freeze it back up
+            if (!hasCurrent) { shouldWrite = false; break; }
+            if (item.DataType == 1) { // float
+                float frozenF; ULONG tmp = (ULONG)item.Value64; memcpy(&frozenF, &tmp, sizeof(float));
+                shouldWrite = currentFloat < frozenF;
+            } else if (item.DataType == 5) { // double
+                double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
+                shouldWrite = currentDouble < frozenD;
+            } else {
+                shouldWrite = currentVal < item.Value64;
+            }
+            break;
+        }
+        case CEFreezeType::AllowDecrease: {
+            // Allow decrease: if current > frozen, freeze it back down
+            if (!hasCurrent) { shouldWrite = false; break; }
+            if (item.DataType == 1) {
+                float frozenF; ULONG tmp = (ULONG)item.Value64; memcpy(&frozenF, &tmp, sizeof(float));
+                shouldWrite = currentFloat > frozenF;
+            } else if (item.DataType == 5) {
+                double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
+                shouldWrite = currentDouble > frozenD;
+            } else {
+                shouldWrite = currentVal > item.Value64;
+            }
+            break;
+        }
+    }
+
+    if (shouldWrite) {
+        // CE: FrozenValue is string, but we have Value64 as binary
+        // Write via kernel driver (DbkWriteBytes) - CE uses WriteProcessMemory via driver when DBK active
+        WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+    }
+}
+
 void FreezeLoop() {
+    // CE's freeze thread: loops every ~100ms, calls ApplyFreeze for each active record
+    // We use 50ms for more responsive freeze, same as original CE default (can be configured)
     while (g_FreezeRunning) {
-        if (g_hDriver != INVALID_HANDLE_VALUE) {
-            std::lock_guard<std::mutex> lock(g_CheatTableLock);
-            for (auto& item : g_CheatTable) { if (item.Enabled && item.Pid != 0) WriteMemory(item.Pid, item.Address, item.Value64, item.DataType); }
+        if (g_hDriver != INVALID_HANDLE_VALUE && g_SelectedPid != 0) {
+            std::vector<CheatItem> copy;
+            {
+                std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                copy = g_CheatTable; // copy to avoid holding lock during kernel reads/writes
+            }
+            bool is64 = g_SelectedIs64;
+            for (auto& item : copy) {
+                if (!item.Enabled) continue;
+                if (item.Pid == 0) continue;
+                // Only freeze items for selected pid? CE freezes all, but we filter to selected pid for safety
+                // Actually CE freezes all pids, but we keep simple: freeze if pid matches selected or if selected is 0
+                // For kernel driver, we can freeze any pid
+                ApplyFreezeForItem(item, is64);
+            }
+            // Update last seen values back to main table for UI (optional)
+            {
+                std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
+                    g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
+                    g_CheatTable[i].RealAddress = copy[i].RealAddress;
+                }
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -410,9 +596,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     }
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    char winTitle[128];
-    sprintf_s(winTitle, "Imno %s - DBK64 (Kernel Only)", IMNO_VERSION_STRING);
-    GLFWwindow* window = glfwCreateWindow(1280, 720, winTitle, NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Imno - DBK64 (Kernel Only) - Freeze System CE Clone", NULL, NULL);
     if (!window) { glfwTerminate(); return 1; }
     g_Window = window; g_hWnd = glfwGetWin32Window(window);
 
@@ -442,9 +626,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         if (fbWidth == 0 || fbHeight == 0) { Sleep(10); continue; }
         ImGui_ImplDX11_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always); ImGui::SetNextWindowSize(ImVec2((float)fbWidth, (float)fbHeight), ImGuiCond_Always);
-        char mainTitle[128];
-        sprintf_s(mainTitle, "Imno %s - DBK64 (Kernel Only) - Scanner Normal + Memory View CE Full", IMNO_VERSION_STRING);
-        ImGui::Begin(mainTitle, NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
+        ImGui::Begin("Imno - DBK64 (Kernel Only) - Freeze CE Clone + Scanner + Memory View", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) ImGui::TextColored({0.0f, 1.0f, 0.0f, 1.0f}, "[DBK64 Driver: ACTIVE] [KERNEL MODE]");
@@ -500,7 +682,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 {
                     bool doRefresh = !g_IsScanning && (s_NeedValueRefresh || (GetTickCount64() - s_LastValueRefresh > 400));
                     ImGuiListClipper clipper; clipper.Begin((int)s_DisplayAddrs.size());
-                    while (clipper.Step()) { for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) { if (doRefresh) ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType); char valStr[64]; FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr)); char label[160]; sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i); if (ImGui::Selectable(label)) { std::lock_guard<std::mutex> lock(g_CheatTableLock); char desc[64]; sprintf_s(desc, sizeof(desc), "0x%llX", s_DisplayAddrs[i]); g_CheatTable.push_back({s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, ""}); strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), desc); } } }
+                    while (clipper.Step()) { for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) { if (doRefresh) ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType); char valStr[64]; FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr)); char label[160]; sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i); if (ImGui::Selectable(label)) { std::lock_guard<std::mutex> lock(g_CheatTableLock); char desc[64]; sprintf_s(desc, sizeof(desc), "0x%llX", s_DisplayAddrs[i]); CheatItem ni{}; ni.Address = s_DisplayAddrs[i]; ni.Value64 = s_DisplayVals[i]; ni.Enabled = false; ni.DataType = g_ResultsDataType; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.IsPointer = false; ni.BaseAddress = s_DisplayAddrs[i]; ni.RealAddress = s_DisplayAddrs[i]; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); FormatValueToString(ni.Value64, ni.DataType, ni.FrozenValueStr, sizeof(ni.FrozenValueStr)); FormatValueToString(ni.Value64, ni.DataType, ni.CurrentValueStr, sizeof(ni.CurrentValueStr)); g_CheatTable.push_back(ni); } } }
                     if (doRefresh) { s_LastValueRefresh = GetTickCount64(); s_NeedValueRefresh = false; }
                 }
                 ImGui::EndChild(); ImGui::EndTabItem();
@@ -509,22 +691,144 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 MemoryView_Render();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Cheat Table")) {
-                ImGui::Text("Cheat Table (Active Freeze & Patches):");
-                ImGui::BeginChild("CheatTableChild", ImVec2(0, 300), true);
+            if (ImGui::BeginTabItem("Cheat Table [CE Freeze Clone]")) {
+                ImGui::Text("Cheat Table - Full CE Freeze System (Kernel Driver)");
+                ImGui::TextDisabled("ftFrozen=exact, ftAllowIncrease=block decrease (allow inc), ftAllowDecrease=block increase (allow dec) | Pointer chain via DbkReadBytes | Writes via DbkWriteBytes");
+                ImGui::Separator();
+                if (ImGui::Button("Add Manual Entry")) {
+                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    CheatItem ni{}; ni.Address = 0; ni.BaseAddress = 0; ni.RealAddress = 0; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.IsPointer = false; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, "New Entry"); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear All")) { std::lock_guard<std::mutex> lock(g_CheatTableLock); g_CheatTable.clear(); }
+                ImGui::SameLine();
+                ImGui::TextDisabled("Count: %zu | FreezeLoop 50ms kernel", g_CheatTable.size());
+
+                // Table header
+                ImGui::BeginChild("CheatTableChild", ImVec2(0, 0), true);
                 {
                     std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                    for (int i = 0; i < (int)g_CheatTable.size(); i++) {
-                        ImGui::PushID(i); bool isEnabled = g_CheatTable[i].Enabled; if (ImGui::Checkbox("##en", &isEnabled)) g_CheatTable[i].Enabled = isEnabled; ImGui::SameLine();
-                        ImGui::Text("0x%llX [PID %u]", g_CheatTable[i].Address, g_CheatTable[i].Pid); ImGui::SameLine(220);
-                        char valStr[64]; FormatValueToString(g_CheatTable[i].Value64, g_CheatTable[i].DataType, valStr, sizeof(valStr));
-                        ImGui::SetNextItemWidth(140); if (ImGui::InputText("##val", valStr, sizeof(valStr))) g_CheatTable[i].Value64 = ParseInputToValue(valStr, g_CheatTable[i].DataType);
-                        ImGui::SameLine(380); ImGui::SetNextItemWidth(180); ImGui::InputText("##desc", g_CheatTable[i].Description, sizeof(g_CheatTable[i].Description));
-                        ImGui::SameLine(570); if (ImGui::Button("Remove")) g_CheatTable.erase(g_CheatTable.begin() + i--);
-                        ImGui::PopID();
+                    // Column headers
+                    if (ImGui::BeginTable("CheatTableCE", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Resizable)) {
+                        ImGui::TableSetupColumn("Active", ImGuiTableColumnFlags_WidthFixed, 50);
+                        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthFixed, 150);
+                        ImGui::TableSetupColumn("Address / Base", ImGuiTableColumnFlags_WidthFixed, 150);
+                        ImGui::TableSetupColumn("Real Addr", ImGuiTableColumnFlags_WidthFixed, 130);
+                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70);
+                        ImGui::TableSetupColumn("Frozen Value", ImGuiTableColumnFlags_WidthFixed, 120);
+                        ImGui::TableSetupColumn("FreezeType", ImGuiTableColumnFlags_WidthFixed, 140);
+                        ImGui::TableSetupColumn("Pointer", ImGuiTableColumnFlags_WidthFixed, 200);
+                        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80);
+                        ImGui::TableHeadersRow();
+                        for (int i = 0; i < (int)g_CheatTable.size(); i++) {
+                            ImGui::TableNextRow();
+                            ImGui::PushID(i);
+                            auto& it = g_CheatTable[i];
+                            // Active
+                            ImGui::TableSetColumnIndex(0);
+                            bool isEnabled = it.Enabled;
+                            if (ImGui::Checkbox("##en", &isEnabled)) { it.Enabled = isEnabled; }
+                            // Description
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::SetNextItemWidth(-1);
+                            ImGui::InputText("##desc", it.Description, sizeof(it.Description));
+                            // Address / Base
+                            ImGui::TableSetColumnIndex(2);
+                            {
+                                char addrStr[64]; sprintf_s(addrStr, "0x%llX", it.IsPointer ? it.BaseAddress : it.Address);
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::InputText("##addr", addrStr, sizeof(addrStr))) {
+                                    ULONG_PTR parsed = (ULONG_PTR)_strtoui64(addrStr, NULL, 0);
+                                    if (it.IsPointer) it.BaseAddress = parsed; else { it.Address = parsed; it.RealAddress = parsed; }
+                                }
+                            }
+                            // Real Addr
+                            ImGui::TableSetColumnIndex(3);
+                            {
+                                char realStr[64]; sprintf_s(realStr, "0x%llX", it.RealAddress);
+                                ImGui::TextDisabled("%s", realStr);
+                                if (it.IsPointer && it.RealAddress==0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "(?)"); }
+                            }
+                            // Type
+                            ImGui::TableSetColumnIndex(4);
+                            {
+                                const char* typeNames[] = { "8 Bytes","Float","2 Bytes","1 Byte","4 Bytes","Double" };
+                                int typeIdx = it.DataType;
+                                // map DataType to combo idx: our DataType values are 0=8,1=float,2=2,3=1,4=4,5=double -> keep same order as array? Use direct mapping
+                                const char* curName = "4 Bytes";
+                                switch(it.DataType){ case 0: curName="8 Bytes"; break; case 1: curName="Float"; break; case 2: curName="2 Bytes"; break; case 3: curName="1 Byte"; break; case 4: curName="4 Bytes"; break; case 5: curName="Double"; break; }
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::BeginCombo("##type", curName)) {
+                                    if (ImGui::Selectable("1 Byte", it.DataType==3)) it.DataType=3;
+                                    if (ImGui::Selectable("2 Bytes", it.DataType==2)) it.DataType=2;
+                                    if (ImGui::Selectable("4 Bytes", it.DataType==4)) it.DataType=4;
+                                    if (ImGui::Selectable("8 Bytes", it.DataType==0)) it.DataType=0;
+                                    if (ImGui::Selectable("Float", it.DataType==1)) it.DataType=1;
+                                    if (ImGui::Selectable("Double", it.DataType==5)) it.DataType=5;
+                                    ImGui::EndCombo();
+                                }
+                            }
+                            // Frozen Value
+                            ImGui::TableSetColumnIndex(5);
+                            {
+                                char valStr[64]; FormatValueToString(it.Value64, it.DataType, valStr, sizeof(valStr));
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::InputText("##fval", valStr, sizeof(valStr))) {
+                                    it.Value64 = ParseInputToValue(valStr, it.DataType);
+                                    strcpy_s(it.FrozenValueStr, sizeof(it.FrozenValueStr), valStr);
+                                }
+                                // Show current value as tooltip
+                                if (ImGui::IsItemHovered()) {
+                                    char curStr[64]; FormatValueToString(it.LastSeenValue, it.DataType, curStr, sizeof(curStr));
+                                    ImGui::SetTooltip("Current in memory: %s", curStr);
+                                }
+                            }
+                            // FreezeType
+                            ImGui::TableSetColumnIndex(6);
+                            {
+                                const char* ftNames[] = { "Frozen", "Allow Increase", "Allow Decrease" };
+                                int ftIdx = (int)it.FreezeType;
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::BeginCombo("##ft", ftNames[ftIdx])) {
+                                    if (ImGui::Selectable("Frozen (exact)", it.FreezeType==CEFreezeType::Frozen)) { it.FreezeType=CEFreezeType::Frozen; it.UpdateAllowFlags(); }
+                                    if (ImGui::Selectable("Allow Increase", it.FreezeType==CEFreezeType::AllowIncrease)) { it.FreezeType=CEFreezeType::AllowIncrease; it.UpdateAllowFlags(); }
+                                    if (ImGui::Selectable("Allow Decrease", it.FreezeType==CEFreezeType::AllowDecrease)) { it.FreezeType=CEFreezeType::AllowDecrease; it.UpdateAllowFlags(); }
+                                    ImGui::EndCombo();
+                                }
+                            }
+                            // Pointer
+                            ImGui::TableSetColumnIndex(7);
+                            {
+                                bool isPtr = it.IsPointer;
+                                if (ImGui::Checkbox("IsPointer##ptr", &isPtr)) {
+                                    it.IsPointer = isPtr;
+                                    if (isPtr && it.BaseAddress==0) it.BaseAddress = it.Address;
+                                }
+                                if (it.IsPointer) {
+                                    ImGui::SameLine();
+                                    // Offsets edit as comma separated hex/dec
+                                    char offStr[256] = {0};
+                                    for (size_t o=0;o<it.Offsets.size();o++){ char tmp[32]; sprintf_s(tmp, "%X", it.Offsets[o]); strcat_s(offStr, tmp); if(o+1<it.Offsets.size()) strcat_s(offStr, ","); }
+                                    ImGui::SetNextItemWidth(120);
+                                    if (ImGui::InputText("Offsets##off", offStr, sizeof(offStr))) {
+                                        it.Offsets.clear();
+                                        // parse comma separated
+                                        char* ctx=nullptr; char* tok = strtok_s(offStr, ",", &ctx);
+                                        while(tok){ int off = (int)strtol(tok, NULL, 0); it.Offsets.push_back(off); tok = strtok_s(nullptr, ",", &ctx); }
+                                    }
+                                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Comma separated offsets hex/dec, e.g. 0,10,28");
+                                }
+                            }
+                            // Action
+                            ImGui::TableSetColumnIndex(8);
+                            if (ImGui::Button("Remove")) { g_CheatTable.erase(g_CheatTable.begin()+i--); ImGui::PopID(); continue; }
+                            ImGui::PopID();
+                        }
+                        ImGui::EndTable();
                     }
                 }
-                ImGui::EndChild(); ImGui::EndTabItem();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }

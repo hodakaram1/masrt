@@ -23,7 +23,6 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_dx11.h"
 #include "Resource.h"
-#include "Version.h"
 
 // =====================================================================
 //  DBK64 Kernel Driver Configuration
@@ -164,15 +163,49 @@ typedef struct _ModuleInfo {
 #pragma pack(pop)
 
 // =====================================================================
-//  Cheat Table Item Structure
+//  CE Freeze System - cloned from MemoryRecordUnit.pas TFreezeType
+//  ftFrozen = exact freeze, ftAllowIncrease = allow increase (freeze if below), ftAllowDecrease = allow decrease (freeze if above)
 // =====================================================================
+enum class CEFreezeType {
+    Frozen = 0,          // ftFrozen - exact freeze (CE default)
+    AllowIncrease = 1,   // ftAllowIncrease - value can increase, but not decrease below frozen
+    AllowDecrease = 2    // ftAllowDecrease - value can decrease, but not increase above frozen
+};
+
 struct CheatItem {
-    ULONG_PTR Address;
-    ULONG64   Value64;
-    bool      Enabled;
-    int       DataType;
-    ULONG     Pid;
-    char      Description[64];
+    ULONG_PTR Address = 0;          // Real address or base for pointer
+    ULONG64   Value64 = 0;          // Frozen value (CE: FrozenValue)
+    bool      Enabled = false;      // Active (CE: fActive)
+    int       DataType = 4;         // 0=8bytes,1=float,2=2bytes,3=1byte,4=4bytes,5=double
+    ULONG     Pid = 0;
+    char      Description[64] = {0};
+
+    // CE Freeze extensions (TFreezeType clone)
+    CEFreezeType FreezeType = CEFreezeType::Frozen; // ftFrozen/ftAllowIncrease/ftAllowDecrease
+    bool      AllowIncrease = false;
+    bool      AllowDecrease = false;
+
+    // Pointer support (CE: fpointeroffsets)
+    bool      IsPointer = false;
+    ULONG_PTR BaseAddress = 0; // if pointer, this is base (e.g. module base)
+    std::vector<int> Offsets; // offsets chain
+    ULONG_PTR RealAddress = 0; // resolved real address (CE: RealAddress)
+    ULONG_PTR BaseAddressResolved = 0; // last resolved base
+
+    // Tracking (CE: LastSeenValue, CurrentValue, FrozenValue string)
+    ULONG64   LastSeenValue = 0;
+    char      CurrentValueStr[64] = {0};
+    char      FrozenValueStr[64] = {0};
+
+    // Timing (CE: OnlyUpdateAfterInterval / update interval per offset)
+    DWORD     UpdateInterval = 500; // ms, how often to re-resolve pointer
+    ULONGLONG LastUpdateTick = 0;
+
+    // Helpers
+    void UpdateAllowFlags() {
+        AllowIncrease = (FreezeType == CEFreezeType::AllowIncrease);
+        AllowDecrease = (FreezeType == CEFreezeType::AllowDecrease);
+    }
 };
 
 // =====================================================================
@@ -217,9 +250,12 @@ bool DbkGetWow64Peb(ULONG pid, ULONG64* outWow64Peb);
 bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
 // =====================================================================
-//  Workers / UI - simplified (only Memory Scanner, Cheat Table, Memory View)
+//  Workers / UI - Memory Scanner, Cheat Table, Memory View, Freeze
 // =====================================================================
 void FreezeLoop();
+bool ResolvePointerAddress(ULONG pid, ULONG_PTR base, const std::vector<int>& offsets, bool is64, ULONG_PTR* outReal);
+bool GetRealAddressForItem(CheatItem& item, bool is64, ULONG_PTR* outAddr);
+void ApplyFreezeForItem(CheatItem& item, bool is64); // CE TMemoryRecord.ApplyFreeze clone
 void RefreshProcessList();
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned);
 void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults);
