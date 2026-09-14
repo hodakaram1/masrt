@@ -5,6 +5,11 @@
 #include <Psapi.h>
 #pragma comment(lib, "psapi.lib")
 
+#pragma warning(push)
+#pragma warning(disable:4244) // int -> float, harmless for ImGui
+#pragma warning(disable:4267) // size_t -> int
+#pragma warning(disable:4305) // double -> float
+
 MemViewState g_MemView;
 
 // Helpers
@@ -1336,7 +1341,9 @@ void MemoryView_Render() {
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 }
+
+#pragma warning(pop)
