@@ -717,7 +717,16 @@ static void NextScanWorkerThread(std::vector<CEFoundResult> prevResults, CEScanP
 // Public API
 // ------------------------------------------------------------------
 void MemoryScanner_Init() {
-    g_Scanner = CEScannerState();
+    // Cannot assign whole CEScannerState because it contains mutex/atomic (deleted copy)
+    // Manually reset fields
+    {
+        std::lock_guard<std::mutex> lock(g_Scanner.resultsLock);
+        g_Scanner.results.clear();
+        g_Scanner.displayCache.clear();
+        g_Scanner.undoStack.clear();
+        g_Scanner.previousResultsBackup.clear();
+    }
+    g_Scanner.params = CEScanParams(); // CEScanParams is trivially copyable
     strcpy_s(g_Scanner.params.valueInput, sizeof(g_Scanner.params.valueInput), "0");
     strcpy_s(g_Scanner.params.value2Input, sizeof(g_Scanner.params.value2Input), "0");
     strcpy_s(g_Scanner.params.alignmentInput, sizeof(g_Scanner.params.alignmentInput), "4");
@@ -727,9 +736,25 @@ void MemoryScanner_Init() {
     g_Scanner.params.valueType = CEValueType::DWord;
     g_Scanner.params.scanType = CEScanType::ExactValue;
     g_Scanner.params.fastScan = true;
+    g_Scanner.params.fastScanAligned = true;
     g_Scanner.params.writable = TriState::IncludeOnly;
     g_Scanner.params.executable = TriState::DontCare;
     g_Scanner.params.copyOnWrite = TriState::DontCare;
+    g_Scanner.params.pauseWhileScanning = false;
+    g_Scanner.params.hex = false;
+    g_Scanner.params.unicode = false;
+    g_Scanner.params.caseSensitive = false;
+
+    g_Scanner.isScanning = false;
+    g_Scanner.progress = 0;
+    g_Scanner.truncated = false;
+    g_Scanner.version = 0;
+    g_Scanner.displayVersion = 0xFFFFFFFF;
+    g_Scanner.selectedResultIdx = -1;
+    g_Scanner.resultFilter[0] = '\0';
+    strcpy_s(g_Scanner.foundCountText, sizeof(g_Scanner.foundCountText), "0");
+    g_Scanner.scanStart = 0x10000;
+    g_Scanner.scanStop = 0x7FFFFFFFFFFFULL;
 }
 
 void MemoryScanner_Shutdown() {}
