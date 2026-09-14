@@ -38,11 +38,21 @@ std::atomic<unsigned>  g_ScanVersion(0);
 int                    g_ResultsDataType = 4;
 bool                   g_SelectedIs64 = true;
 
-// Cheat Table & Freeze
+// Cheat Table & Freeze - CE clone + speed + trigger
 std::vector<CheatItem> g_CheatTable;
 std::mutex g_CheatTableLock;
 std::atomic<bool> g_FreezeRunning(true);
 std::thread g_FreezeThread;
+
+// Freeze speed + trigger (user requested GUI control)
+std::atomic<int>  g_FreezeIntervalMs(50);      // 10-2000ms, user editable from GUI
+std::atomic<bool> g_FreezeEnabled(true);      // global enable
+std::atomic<int>  g_FreezeMode((int)CEFreezeMode::Continuous);
+std::atomic<int>  g_FreezeTriggerKey(0x75);   // VK_F6 default
+std::atomic<bool> g_FreezeManualTrigger(false);
+std::atomic<int>  g_FreezeCount(0);
+std::atomic<int>  g_FreezeLastMs(0);
+char g_FreezeTriggerKeyName[32] = "F6";
 
 // Kernel status (for driver messages)
 ULONG     g_KernelVersion = 0;
@@ -364,27 +374,23 @@ bool GetRealAddressForItem(CheatItem& item, bool is64, ULONG_PTR* outAddr) {
 }
 
 void ApplyFreezeForItem(CheatItem& item, bool is64) {
-    // Clone of TMemoryRecord.ApplyFreeze
-    // - If not active (Enabled false) -> do nothing
-    // - Resolve real address (pointer support)
-    // - Read current value from memory
-    // - Depending on FreezeType:
-    //   ftFrozen: always write frozen value
-    //   ftAllowIncrease: only write if current < frozen (allow increase, block decrease)
-    //   ftAllowDecrease: only write if current > frozen (allow decrease, block increase)
-
+    // Clone of TMemoryRecord.ApplyFreeze + Trigger extensions
     if (!item.Enabled) return;
     if (item.Pid == 0) return;
     if (g_hDriver == INVALID_HANDLE_VALUE) return;
 
+    // Check per-item trigger filter (unless manual trigger ignoring filter)
+    // This check is also done in FreezeLoop, but keep for safety when called directly
+    // For OnHotkey, we check global key state outside, but here we still allow if Always
+    if (item.Trigger == CEFreezeTrigger::Once && item.OneShotDone) return;
+
     ULONG_PTR realAddr = 0;
     if (!GetRealAddressForItem(item, is64, &realAddr)) {
-        // Could not resolve pointer, skip
         return;
     }
 
-    // For AllowIncrease/Decrease we need to read current value
-    bool needRead = (item.FreezeType != CEFreezeType::Frozen);
+    // For AllowIncrease/Decrease and OnValueChanged we need current value
+    bool needRead = (item.FreezeType != CEFreezeType::Frozen) || (item.Trigger == CEFreezeTrigger::OnValueChanged);
 
     ULONG64 currentVal = 0;
     float currentFloat = 0.0f;
@@ -392,97 +398,271 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
     bool hasCurrent = false;
 
     if (needRead) {
-        // Read current memory
         ULONG64 v = 0;
         ULONG sz = GetDataSize(item.DataType);
         if (DbkReadBytes(item.Pid, realAddr, &v, sz)) {
             currentVal = v;
             hasCurrent = true;
-            if (item.DataType == 1) { // float
+            if (item.DataType == 1) {
                 ULONG tmp = (ULONG)v;
                 memcpy(&currentFloat, &tmp, sizeof(float));
-            } else if (item.DataType == 5) { // double
+            } else if (item.DataType == 5) {
                 memcpy(&currentDouble, &v, sizeof(double));
             }
             item.LastSeenValue = v;
         } else {
-            // Can't read, still try to write for ftFrozen? For allow modes, skip
-            if (item.FreezeType != CEFreezeType::Frozen) return;
+            if (item.FreezeType != CEFreezeType::Frozen && item.Trigger != CEFreezeTrigger::OnValueChanged) {
+                // For Allow modes, if can't read skip
+                if (item.FreezeType != CEFreezeType::Frozen) return;
+            }
         }
     }
 
     bool shouldWrite = false;
 
+    // Trigger logic
+    switch (item.Trigger) {
+        case CEFreezeTrigger::Always:
+        case CEFreezeTrigger::ManualOnly:
+        case CEFreezeTrigger::OnHotkey:
+            // Trigger filtering done by caller, here we just apply FreezeType logic
+            break;
+        case CEFreezeTrigger::OnValueChanged:
+            if (!hasCurrent) { shouldWrite = false; break; }
+            // Only freeze if current != frozen
+            if (item.DataType == 1) {
+                float frozenF; ULONG tmp = (ULONG)item.Value64; memcpy(&frozenF, &tmp, sizeof(float));
+                shouldWrite = fabsf(currentFloat - frozenF) > 0.001f;
+            } else if (item.DataType == 5) {
+                double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
+                shouldWrite = fabs(currentDouble - frozenD) > 0.001;
+            } else {
+                shouldWrite = currentVal != item.Value64;
+            }
+            // Then still apply FreezeType filter below if needed? For OnValueChanged we want exact freeze when changed
+            // So if shouldWrite true, we will write, but also respect Allow modes
+            if (!shouldWrite) return;
+            break;
+        case CEFreezeTrigger::Once:
+            if (item.OneShotDone) return;
+            shouldWrite = true; // will write once
+            break;
+    }
+
+    // FreezeType logic (ftFrozen / AllowIncrease / AllowDecrease)
+    bool freezeTypeAllows = false;
     switch (item.FreezeType) {
         case CEFreezeType::Frozen:
-            shouldWrite = true;
+            freezeTypeAllows = true;
             break;
         case CEFreezeType::AllowIncrease: {
-            // Allow increase: if current < frozen, freeze it back up
-            if (!hasCurrent) { shouldWrite = false; break; }
-            if (item.DataType == 1) { // float
+            if (!hasCurrent) { freezeTypeAllows = false; break; }
+            if (item.DataType == 1) {
                 float frozenF; ULONG tmp = (ULONG)item.Value64; memcpy(&frozenF, &tmp, sizeof(float));
-                shouldWrite = currentFloat < frozenF;
-            } else if (item.DataType == 5) { // double
+                freezeTypeAllows = currentFloat < frozenF;
+            } else if (item.DataType == 5) {
                 double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
-                shouldWrite = currentDouble < frozenD;
+                freezeTypeAllows = currentDouble < frozenD;
             } else {
-                shouldWrite = currentVal < item.Value64;
+                freezeTypeAllows = currentVal < item.Value64;
             }
             break;
         }
         case CEFreezeType::AllowDecrease: {
-            // Allow decrease: if current > frozen, freeze it back down
-            if (!hasCurrent) { shouldWrite = false; break; }
+            if (!hasCurrent) { freezeTypeAllows = false; break; }
             if (item.DataType == 1) {
                 float frozenF; ULONG tmp = (ULONG)item.Value64; memcpy(&frozenF, &tmp, sizeof(float));
-                shouldWrite = currentFloat > frozenF;
+                freezeTypeAllows = currentFloat > frozenF;
             } else if (item.DataType == 5) {
                 double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
-                shouldWrite = currentDouble > frozenD;
+                freezeTypeAllows = currentDouble > frozenD;
             } else {
-                shouldWrite = currentVal > item.Value64;
+                freezeTypeAllows = currentVal > item.Value64;
             }
             break;
         }
     }
 
+    // Combine trigger + freeze type
+    if (item.Trigger == CEFreezeTrigger::OnValueChanged) {
+        // already filtered, but still need freeze type allows if not Frozen
+        if (item.FreezeType != CEFreezeType::Frozen) shouldWrite = freezeTypeAllows;
+        else shouldWrite = true;
+    } else {
+        shouldWrite = freezeTypeAllows;
+    }
+
     if (shouldWrite) {
-        // CE: FrozenValue is string, but we have Value64 as binary
-        // Write via kernel driver (DbkWriteBytes) - CE uses WriteProcessMemory via driver when DBK active
         WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+        if (item.Trigger == CEFreezeTrigger::Once) {
+            item.OneShotDone = true;
+            // Auto-disable after once? Keep enabled but mark done, or disable
+            // We auto-disable to mimic CE one-shot
+            item.Enabled = false;
+        }
+        item.LastTriggerTick = GetTickCount64();
+        g_FreezeCount++;
+    }
+}
+
+void TriggerFreezeNow(bool ignoreTriggerFilter) {
+    if (g_hDriver == INVALID_HANDLE_VALUE) return;
+    std::vector<CheatItem> copy;
+    {
+        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+        copy = g_CheatTable;
+    }
+    bool is64 = g_SelectedIs64;
+    int triggered = 0;
+    for (auto& item : copy) {
+        if (!item.Enabled && !ignoreTriggerFilter) continue;
+        if (item.Pid == 0) continue;
+        if (!ignoreTriggerFilter) {
+            // If ManualOnly trigger, only trigger those with ManualOnly or Always? We trigger all enabled when manual button pressed
+            // For manual trigger, we want to trigger all enabled regardless of per-item trigger, except Once already done
+            if (item.Trigger == CEFreezeTrigger::Once && item.OneShotDone) continue;
+        }
+        // For manual trigger, we bypass per-item Trigger check except Once
+        // Call Apply but with forced write for ManualOnly items
+        ULONG_PTR realAddr = 0;
+        // Use GetRealAddressForItem on copy item (need mutable)
+        if (!GetRealAddressForItem(item, is64, &realAddr)) continue;
+        // Direct write ignoring FreezeType for manual trigger? No, respect FreezeType but force
+        // Simplest: call ApplyFreezeForItem which respects FreezeType
+        // For manual trigger we want to force write even if AllowIncrease condition not met, so we write directly
+        if (ignoreTriggerFilter) {
+            WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+            triggered++;
+        } else {
+            // Use Apply logic but ensure ManualOnly items get written
+            if (item.Trigger == CEFreezeTrigger::ManualOnly) {
+                WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+                item.LastTriggerTick = GetTickCount64();
+                triggered++;
+                if (item.Trigger == CEFreezeTrigger::Once) {
+                    item.OneShotDone = true;
+                    item.Enabled = false;
+                }
+            } else {
+                // For Always/OnHotkey/OnValueChanged, use normal Apply
+                ApplyFreezeForItem(item, is64);
+                triggered++;
+            }
+        }
+    }
+    // Update back
+    {
+        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+        for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
+            g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
+            g_CheatTable[i].RealAddress = copy[i].RealAddress;
+            g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
+            g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
+            if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
+                g_CheatTable[i].Enabled = false;
+            }
+        }
+    }
+    g_FreezeCount += triggered;
+}
+
+void TriggerFreezeSingle(int index) {
+    if (g_hDriver == INVALID_HANDLE_VALUE) return;
+    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+    if (index < 0 || index >= (int)g_CheatTable.size()) return;
+    auto& item = g_CheatTable[index];
+    if (item.Pid == 0) return;
+    bool is64 = g_SelectedIs64;
+    ULONG_PTR realAddr = 0;
+    if (!GetRealAddressForItem(item, is64, &realAddr)) return;
+    WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+    item.LastTriggerTick = GetTickCount64();
+    g_FreezeCount++;
+    if (item.Trigger == CEFreezeTrigger::Once) {
+        item.OneShotDone = true;
+        item.Enabled = false;
     }
 }
 
 void FreezeLoop() {
-    // CE's freeze thread: loops every ~100ms, calls ApplyFreeze for each active record
-    // We use 50ms for more responsive freeze, same as original CE default (can be configured)
+    ULONGLONG lastTick = GetTickCount64();
     while (g_FreezeRunning) {
-        if (g_hDriver != INVALID_HANDLE_VALUE && g_SelectedPid != 0) {
-            std::vector<CheatItem> copy;
-            {
-                std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                copy = g_CheatTable; // copy to avoid holding lock during kernel reads/writes
+        ULONGLONG loopStart = GetTickCount64();
+        bool doFreeze = false;
+
+        if (g_hDriver != INVALID_HANDLE_VALUE && g_SelectedPid != 0 && g_FreezeEnabled) {
+            int mode = g_FreezeMode.load();
+            bool manualPulse = g_FreezeManualTrigger.exchange(false);
+
+            if (mode == (int)CEFreezeMode::Continuous) {
+                doFreeze = true;
+            } else if (mode == (int)CEFreezeMode::ManualOnly) {
+                doFreeze = manualPulse; // only when manual trigger button pressed
+            } else if (mode == (int)CEFreezeMode::WhileKeyPressed) {
+                int vk = g_FreezeTriggerKey.load();
+                if (vk != 0 && (GetAsyncKeyState(vk) & 0x8000)) {
+                    doFreeze = true;
+                } else {
+                    doFreeze = manualPulse; // allow manual pulse even in this mode
+                }
             }
-            bool is64 = g_SelectedIs64;
-            for (auto& item : copy) {
-                if (!item.Enabled) continue;
-                if (item.Pid == 0) continue;
-                // Only freeze items for selected pid? CE freezes all, but we filter to selected pid for safety
-                // Actually CE freezes all pids, but we keep simple: freeze if pid matches selected or if selected is 0
-                // For kernel driver, we can freeze any pid
-                ApplyFreezeForItem(item, is64);
-            }
-            // Update last seen values back to main table for UI (optional)
-            {
-                std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
-                    g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
-                    g_CheatTable[i].RealAddress = copy[i].RealAddress;
+
+            if (doFreeze) {
+                std::vector<CheatItem> copy;
+                {
+                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    copy = g_CheatTable;
+                }
+                bool is64 = g_SelectedIs64;
+                for (auto& item : copy) {
+                    if (!item.Enabled) continue;
+                    if (item.Pid == 0) continue;
+
+                    // Per-item trigger filtering
+                    if (item.Trigger == CEFreezeTrigger::ManualOnly) {
+                        // In Continuous mode, ManualOnly items should NOT auto-freeze, only on manual trigger
+                        if (mode == (int)CEFreezeMode::Continuous && !manualPulse) continue;
+                        // In ManualOnly mode, they freeze when manualPulse (already doFreeze true)
+                    } else if (item.Trigger == CEFreezeTrigger::OnHotkey) {
+                        int vk = g_FreezeTriggerKey.load();
+                        if (vk == 0) continue;
+                        if (!(GetAsyncKeyState(vk) & 0x8000) && !manualPulse) continue;
+                    } else if (item.Trigger == CEFreezeTrigger::Once) {
+                        if (item.OneShotDone) continue;
+                    }
+                    // Always and OnValueChanged are handled inside ApplyFreezeForItem
+
+                    ApplyFreezeForItem(item, is64);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
+                        g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
+                        g_CheatTable[i].RealAddress = copy[i].RealAddress;
+                        g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
+                        g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
+                        if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
+                            g_CheatTable[i].Enabled = false;
+                        }
+                    }
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        ULONGLONG loopEnd = GetTickCount64();
+        g_FreezeLastMs = (int)(loopEnd - loopStart);
+
+        int interval = g_FreezeIntervalMs.load();
+        if (interval < 10) interval = 10;
+        if (interval > 5000) interval = 5000;
+
+        // Sleep for interval, but check for early exit every 10ms
+        ULONGLONG target = GetTickCount64() + interval;
+        while (g_FreezeRunning && GetTickCount64() < target) {
+            // If manual trigger requested and mode is ManualOnly, break early to trigger immediately
+            if (g_FreezeManualTrigger.load() && g_FreezeMode.load() == (int)CEFreezeMode::ManualOnly) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 }
 
@@ -691,34 +871,114 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 MemoryView_Render();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Cheat Table [CE Freeze Clone]")) {
-                ImGui::Text("Cheat Table - Full CE Freeze System (Kernel Driver)");
-                ImGui::TextDisabled("ftFrozen=exact, ftAllowIncrease=block decrease (allow inc), ftAllowDecrease=block increase (allow dec) | Pointer chain via DbkReadBytes | Writes via DbkWriteBytes");
+            if (ImGui::BeginTabItem("Cheat Table [CE Freeze Clone + Speed + Trigger]")) {
+                ImGui::Text("Cheat Table - CE Freeze System + Speed Control + Trigger (Kernel Driver)");
+                ImGui::TextDisabled("FreezeType: Frozen=exact, AllowIncrease=block decrease, AllowDecrease=block increase | Pointer via DbkReadBytes | Write via DbkWriteBytes");
                 ImGui::Separator();
-                if (ImGui::Button("Add Manual Entry")) {
-                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                    CheatItem ni{}; ni.Address = 0; ni.BaseAddress = 0; ni.RealAddress = 0; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.IsPointer = false; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, "New Entry"); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Clear All")) { std::lock_guard<std::mutex> lock(g_CheatTableLock); g_CheatTable.clear(); }
-                ImGui::SameLine();
-                ImGui::TextDisabled("Count: %zu | FreezeLoop 50ms kernel", g_CheatTable.size());
 
-                // Table header
+                // === Freeze Speed & Trigger Global Controls (user requested) ===
+                {
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "[Freeze Speed & Trigger]");
+
+                    // Speed control - user can type numbers
+                    int speed = g_FreezeIntervalMs.load();
+                    ImGui::SetNextItemWidth(120);
+                    if (ImGui::SliderInt("Freeze Speed ms", &speed, 10, 1000, "%d ms")) {
+                        if (speed < 10) speed = 10;
+                        if (speed > 5000) speed = 5000;
+                        g_FreezeIntervalMs = speed;
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(80);
+                    if (ImGui::InputInt("##speedNum", &speed, 10, 100)) {
+                        if (speed < 10) speed = 10;
+                        if (speed > 5000) speed = 5000;
+                        g_FreezeIntervalMs = speed;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(10=fast 50=default 200=slow 1000=1s) | Last loop %d ms | Total freezes %d", g_FreezeLastMs.load(), g_FreezeCount.load());
+
+                    // Global enable
+                    bool freezeEn = g_FreezeEnabled.load();
+                    if (ImGui::Checkbox("Freeze Enabled", &freezeEn)) g_FreezeEnabled = freezeEn;
+                    ImGui::SameLine();
+
+                    // Freeze Mode combo
+                    int mode = g_FreezeMode.load();
+                    const char* modeNames[] = { "Continuous (loop)", "Manual Trigger Only", "While Key Pressed" };
+                    ImGui::SetNextItemWidth(200);
+                    if (ImGui::BeginCombo("Freeze Mode", modeNames[mode])) {
+                        if (ImGui::Selectable("Continuous (loop)", mode==0)) g_FreezeMode = 0;
+                        if (ImGui::Selectable("Manual Trigger Only", mode==1)) g_FreezeMode = 1;
+                        if (ImGui::Selectable("While Key Pressed", mode==2)) g_FreezeMode = 2;
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SameLine();
+
+                    // Trigger Key selector
+                    int vk = g_FreezeTriggerKey.load();
+                    const char* keyName = g_FreezeTriggerKeyName;
+                    ImGui::SetNextItemWidth(100);
+                    if (ImGui::BeginCombo("Trigger Key", keyName)) {
+                        struct KeyOpt { int vk; const char* name; };
+                        KeyOpt keys[] = { {0x70,"F1"}, {0x71,"F2"}, {0x72,"F3"}, {0x73,"F4"}, {0x74,"F5"}, {0x75,"F6"}, {0x76,"F7"}, {0x77,"F8"}, {0x78,"F9"}, {0x79,"F10"}, {0x7A,"F11"}, {0x7B,"F12"}, {0x20,"Space"}, {0x11,"Ctrl"}, {0x10,"Shift"}, {0x12,"Alt"}, {0x2D,"Insert"}, {0x2E,"Delete"} };
+                        for (auto& k : keys) {
+                            if (ImGui::Selectable(k.name, vk==k.vk)) { g_FreezeTriggerKey = k.vk; strcpy_s(g_FreezeTriggerKeyName, k.name); }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SameLine();
+                    if (vk != 0) {
+                        bool keyDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                        if (keyDown) ImGui::TextColored(ImVec4(1,1,0,1), "[%s DOWN]", keyName);
+                        else ImGui::TextDisabled("[%s up]", keyName);
+                    }
+
+                    // Trigger buttons
+                    ImGui::Spacing();
+                    if (ImGui::Button("Trigger Freeze NOW", ImVec2(180, 30))) {
+                        g_FreezeManualTrigger = true;
+                        // Also immediate trigger in this thread for responsiveness
+                        TriggerFreezeNow(false);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Force Write All (ignore filter)", ImVec2(220, 30))) {
+                        TriggerFreezeNow(true);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset OneShot Flags")) {
+                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        for (auto& it : g_CheatTable) { it.OneShotDone = false; }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Add Manual Entry")) {
+                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        CheatItem ni{}; ni.Address = 0; ni.BaseAddress = 0; ni.RealAddress = 0; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.Trigger = CEFreezeTrigger::Always; ni.IsPointer = false; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, "New Entry"); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear All")) { std::lock_guard<std::mutex> lock(g_CheatTableLock); g_CheatTable.clear(); }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Count: %zu", g_CheatTable.size());
+                }
+
+                ImGui::Separator();
+
+                // Table
                 ImGui::BeginChild("CheatTableChild", ImVec2(0, 0), true);
                 {
                     std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                    // Column headers
-                    if (ImGui::BeginTable("CheatTableCE", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Resizable)) {
+                    if (ImGui::BeginTable("CheatTableCE", 11, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
                         ImGui::TableSetupColumn("Active", ImGuiTableColumnFlags_WidthFixed, 50);
-                        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthFixed, 150);
-                        ImGui::TableSetupColumn("Address / Base", ImGuiTableColumnFlags_WidthFixed, 150);
-                        ImGui::TableSetupColumn("Real Addr", ImGuiTableColumnFlags_WidthFixed, 130);
+                        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthFixed, 120);
+                        ImGui::TableSetupColumn("Addr/Base", ImGuiTableColumnFlags_WidthFixed, 120);
+                        ImGui::TableSetupColumn("Real Addr", ImGuiTableColumnFlags_WidthFixed, 110);
                         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70);
-                        ImGui::TableSetupColumn("Frozen Value", ImGuiTableColumnFlags_WidthFixed, 120);
-                        ImGui::TableSetupColumn("FreezeType", ImGuiTableColumnFlags_WidthFixed, 140);
-                        ImGui::TableSetupColumn("Pointer", ImGuiTableColumnFlags_WidthFixed, 200);
-                        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80);
+                        ImGui::TableSetupColumn("Frozen Val", ImGuiTableColumnFlags_WidthFixed, 90);
+                        ImGui::TableSetupColumn("FreezeType", ImGuiTableColumnFlags_WidthFixed, 110);
+                        ImGui::TableSetupColumn("Trigger", ImGuiTableColumnFlags_WidthFixed, 110);
+                        ImGui::TableSetupColumn("Pointer", ImGuiTableColumnFlags_WidthFixed, 150);
+                        ImGui::TableSetupColumn("Interval ms", ImGuiTableColumnFlags_WidthFixed, 70);
+                        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 140);
                         ImGui::TableHeadersRow();
                         for (int i = 0; i < (int)g_CheatTable.size(); i++) {
                             ImGui::TableNextRow();
@@ -727,12 +987,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                             // Active
                             ImGui::TableSetColumnIndex(0);
                             bool isEnabled = it.Enabled;
-                            if (ImGui::Checkbox("##en", &isEnabled)) { it.Enabled = isEnabled; }
+                            if (it.Trigger == CEFreezeTrigger::Once && it.OneShotDone) {
+                                ImGui::TextDisabled("Done");
+                            } else {
+                                if (ImGui::Checkbox("##en", &isEnabled)) { it.Enabled = isEnabled; if (it.Trigger==CEFreezeTrigger::Once && isEnabled) it.OneShotDone=false; }
+                            }
                             // Description
                             ImGui::TableSetColumnIndex(1);
                             ImGui::SetNextItemWidth(-1);
                             ImGui::InputText("##desc", it.Description, sizeof(it.Description));
-                            // Address / Base
+                            // Addr/Base
                             ImGui::TableSetColumnIndex(2);
                             {
                                 char addrStr[64]; sprintf_s(addrStr, "0x%llX", it.IsPointer ? it.BaseAddress : it.Address);
@@ -748,13 +1012,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                 char realStr[64]; sprintf_s(realStr, "0x%llX", it.RealAddress);
                                 ImGui::TextDisabled("%s", realStr);
                                 if (it.IsPointer && it.RealAddress==0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "(?)"); }
+                                if (it.LastTriggerTick!=0) {
+                                    ULONGLONG age = GetTickCount64() - it.LastTriggerTick;
+                                    if (age < 500) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0,1,0,1), "*"); }
+                                }
                             }
                             // Type
                             ImGui::TableSetColumnIndex(4);
                             {
-                                const char* typeNames[] = { "8 Bytes","Float","2 Bytes","1 Byte","4 Bytes","Double" };
-                                int typeIdx = it.DataType;
-                                // map DataType to combo idx: our DataType values are 0=8,1=float,2=2,3=1,4=4,5=double -> keep same order as array? Use direct mapping
                                 const char* curName = "4 Bytes";
                                 switch(it.DataType){ case 0: curName="8 Bytes"; break; case 1: curName="Float"; break; case 2: curName="2 Bytes"; break; case 3: curName="1 Byte"; break; case 4: curName="4 Bytes"; break; case 5: curName="Double"; break; }
                                 ImGui::SetNextItemWidth(-1);
@@ -768,7 +1033,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                     ImGui::EndCombo();
                                 }
                             }
-                            // Frozen Value
+                            // Frozen Val
                             ImGui::TableSetColumnIndex(5);
                             {
                                 char valStr[64]; FormatValueToString(it.Value64, it.DataType, valStr, sizeof(valStr));
@@ -777,16 +1042,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                     it.Value64 = ParseInputToValue(valStr, it.DataType);
                                     strcpy_s(it.FrozenValueStr, sizeof(it.FrozenValueStr), valStr);
                                 }
-                                // Show current value as tooltip
                                 if (ImGui::IsItemHovered()) {
                                     char curStr[64]; FormatValueToString(it.LastSeenValue, it.DataType, curStr, sizeof(curStr));
-                                    ImGui::SetTooltip("Current in memory: %s", curStr);
+                                    ImGui::SetTooltip("Current: %s | Frozen: %s | LastTrigger %llu ms ago", curStr, valStr, it.LastTriggerTick? GetTickCount64()-it.LastTriggerTick:0);
                                 }
                             }
                             // FreezeType
                             ImGui::TableSetColumnIndex(6);
                             {
-                                const char* ftNames[] = { "Frozen", "Allow Increase", "Allow Decrease" };
+                                const char* ftNames[] = { "Frozen", "Allow Inc", "Allow Dec" };
                                 int ftIdx = (int)it.FreezeType;
                                 ImGui::SetNextItemWidth(-1);
                                 if (ImGui::BeginCombo("##ft", ftNames[ftIdx])) {
@@ -796,32 +1060,59 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                     ImGui::EndCombo();
                                 }
                             }
-                            // Pointer
+                            // Trigger
                             ImGui::TableSetColumnIndex(7);
                             {
+                                const char* trigNames[] = { "Always", "ManualOnly", "OnHotkey", "OnChange", "Once" };
+                                int tIdx = (int)it.Trigger;
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::BeginCombo("##trig", trigNames[tIdx])) {
+                                    if (ImGui::Selectable("Always", it.Trigger==CEFreezeTrigger::Always)) it.Trigger=CEFreezeTrigger::Always;
+                                    if (ImGui::Selectable("ManualOnly", it.Trigger==CEFreezeTrigger::ManualOnly)) it.Trigger=CEFreezeTrigger::ManualOnly;
+                                    if (ImGui::Selectable("OnHotkey", it.Trigger==CEFreezeTrigger::OnHotkey)) it.Trigger=CEFreezeTrigger::OnHotkey;
+                                    if (ImGui::Selectable("OnValueChanged", it.Trigger==CEFreezeTrigger::OnValueChanged)) it.Trigger=CEFreezeTrigger::OnValueChanged;
+                                    if (ImGui::Selectable("Once (one-shot)", it.Trigger==CEFreezeTrigger::Once)) { it.Trigger=CEFreezeTrigger::Once; it.OneShotDone=false; }
+                                    ImGui::EndCombo();
+                                }
+                            }
+                            // Pointer
+                            ImGui::TableSetColumnIndex(8);
+                            {
                                 bool isPtr = it.IsPointer;
-                                if (ImGui::Checkbox("IsPointer##ptr", &isPtr)) {
+                                if (ImGui::Checkbox("Ptr##ptr", &isPtr)) {
                                     it.IsPointer = isPtr;
                                     if (isPtr && it.BaseAddress==0) it.BaseAddress = it.Address;
                                 }
                                 if (it.IsPointer) {
                                     ImGui::SameLine();
-                                    // Offsets edit as comma separated hex/dec
-                                    char offStr[256] = {0};
-                                    for (size_t o=0;o<it.Offsets.size();o++){ char tmp[32]; sprintf_s(tmp, "%X", it.Offsets[o]); strcat_s(offStr, tmp); if(o+1<it.Offsets.size()) strcat_s(offStr, ","); }
-                                    ImGui::SetNextItemWidth(120);
-                                    if (ImGui::InputText("Offsets##off", offStr, sizeof(offStr))) {
+                                    char offStr[128] = {0};
+                                    for (size_t o=0;o<it.Offsets.size();o++){ char tmp[16]; sprintf_s(tmp, "%X", it.Offsets[o]); strcat_s(offStr, tmp); if(o+1<it.Offsets.size()) strcat_s(offStr, ","); }
+                                    ImGui::SetNextItemWidth(80);
+                                    if (ImGui::InputText("Off##off", offStr, sizeof(offStr))) {
                                         it.Offsets.clear();
-                                        // parse comma separated
                                         char* ctx=nullptr; char* tok = strtok_s(offStr, ",", &ctx);
                                         while(tok){ int off = (int)strtol(tok, NULL, 0); it.Offsets.push_back(off); tok = strtok_s(nullptr, ",", &ctx); }
                                     }
-                                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Comma separated offsets hex/dec, e.g. 0,10,28");
+                                }
+                            }
+                            // Interval
+                            ImGui::TableSetColumnIndex(9);
+                            {
+                                int iv = (int)it.UpdateInterval;
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::InputInt("##iv", &iv, 100, 500)) {
+                                    if (iv < 50) iv = 50;
+                                    if (iv > 10000) iv = 10000;
+                                    it.UpdateInterval = (DWORD)iv;
                                 }
                             }
                             // Action
-                            ImGui::TableSetColumnIndex(8);
-                            if (ImGui::Button("Remove")) { g_CheatTable.erase(g_CheatTable.begin()+i--); ImGui::PopID(); continue; }
+                            ImGui::TableSetColumnIndex(10);
+                            {
+                                if (ImGui::SmallButton("Trig")) { TriggerFreezeSingle(i); }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("X")) { g_CheatTable.erase(g_CheatTable.begin()+i--); ImGui::PopID(); continue; }
+                            }
                             ImGui::PopID();
                         }
                         ImGui::EndTable();

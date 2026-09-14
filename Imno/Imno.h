@@ -165,11 +165,26 @@ typedef struct _ModuleInfo {
 // =====================================================================
 //  CE Freeze System - cloned from MemoryRecordUnit.pas TFreezeType
 //  ftFrozen = exact freeze, ftAllowIncrease = allow increase (freeze if below), ftAllowDecrease = allow decrease (freeze if above)
+//  + Freeze Trigger system (user requested: speed control + trigger)
 // =====================================================================
 enum class CEFreezeType {
     Frozen = 0,          // ftFrozen - exact freeze (CE default)
     AllowIncrease = 1,   // ftAllowIncrease - value can increase, but not decrease below frozen
     AllowDecrease = 2    // ftAllowDecrease - value can decrease, but not increase above frozen
+};
+
+enum class CEFreezeTrigger {
+    Always = 0,          // freeze in loop always (CE default)
+    ManualOnly = 1,      // only when manual trigger button pressed
+    OnHotkey = 2,        // only while global hotkey held
+    OnValueChanged = 3,  // trigger when current value != frozen (watchdog)
+    Once = 4             // freeze once then auto-disable (one-shot)
+};
+
+enum class CEFreezeMode {
+    Continuous = 0,      // continuous loop at interval
+    ManualOnly = 1,      // manual trigger only - loop does nothing
+    WhileKeyPressed = 2  // only freeze while trigger key held
 };
 
 struct CheatItem {
@@ -184,6 +199,11 @@ struct CheatItem {
     CEFreezeType FreezeType = CEFreezeType::Frozen; // ftFrozen/ftAllowIncrease/ftAllowDecrease
     bool      AllowIncrease = false;
     bool      AllowDecrease = false;
+
+    // Freeze Trigger extensions (user requested)
+    CEFreezeTrigger Trigger = CEFreezeTrigger::Always;
+    bool      OneShotDone = false; // for Once trigger
+    ULONGLONG LastTriggerTick = 0;
 
     // Pointer support (CE: fpointeroffsets)
     bool      IsPointer = false;
@@ -256,6 +276,8 @@ void FreezeLoop();
 bool ResolvePointerAddress(ULONG pid, ULONG_PTR base, const std::vector<int>& offsets, bool is64, ULONG_PTR* outReal);
 bool GetRealAddressForItem(CheatItem& item, bool is64, ULONG_PTR* outAddr);
 void ApplyFreezeForItem(CheatItem& item, bool is64); // CE TMemoryRecord.ApplyFreeze clone
+void TriggerFreezeNow(bool ignoreTriggerFilter = false); // user requested freeze trigger
+void TriggerFreezeSingle(int index); // trigger single item
 void RefreshProcessList();
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned);
 void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults);
@@ -274,3 +296,13 @@ extern ULONG g_SelectedPid;
 extern bool g_SelectedIs64;
 extern std::vector<CheatItem> g_CheatTable;
 extern std::mutex g_CheatTableLock;
+
+// Freeze speed + trigger globals (user requested GUI control)
+extern std::atomic<int>  g_FreezeIntervalMs;      // speed control 10-2000ms, default 50
+extern std::atomic<bool> g_FreezeEnabled;         // global enable
+extern std::atomic<int>  g_FreezeMode;            // CEFreezeMode as int
+extern std::atomic<int>  g_FreezeTriggerKey;      // VK code for trigger key (default VK_F6 = 0x75)
+extern std::atomic<bool> g_FreezeManualTrigger;   // set true for one manual pulse
+extern std::atomic<int>  g_FreezeCount;           // how many freezes done
+extern std::atomic<int>  g_FreezeLastMs;          // last loop duration
+extern char g_FreezeTriggerKeyName[32];           // display name for key
