@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{2bf2cfb5-4561-47fe-9dbb-428e47de330b}</ProjectGuid>
+    <RootNamespace>Imno</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\imgui\backends;$(ProjectDir)..\third_party\glfw\include;$(ProjectDir)..\third_party\zydis\include;$(ProjectDir)..\third_party\zydis\src;$(ProjectDir)..\third_party\zycore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\imgui\backends;$(ProjectDir)..\third_party\glfw\include;$(ProjectDir)..\third_party\zydis\include;$(ProjectDir)..\third_party\zydis\src;$(ProjectDir)..\third_party\zycore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\imgui\backends;$(ProjectDir)..\third_party\glfw\include;$(ProjectDir)..\third_party\zydis\include;$(ProjectDir)..\third_party\zydis\src;$(ProjectDir)..\third_party\zycore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\imgui\backends;$(ProjectDir)..\third_party\glfw\include;$(ProjectDir)..\third_party\zydis\include;$(ProjectDir)..\third_party\zydis\src;$(ProjectDir)..\third_party\zycore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="CEServer.h" />
+    <ClInclude Include="Imno.h" />
+    <ClInclude Include="Resource.h" />
+    <ClInclude Include="targetver.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="CEServer.cpp" />
+    <ClCompile Include="Imno.cpp" />
+    <!-- Dear ImGui -->
+    <ClCompile Include="..\third_party\imgui\imgui.cpp" />
+    <ClCompile Include="..\third_party\imgui\imgui_draw.cpp" />
+    <ClCompile Include="..\third_party\imgui\imgui_tables.cpp" />
+    <ClCompile Include="..\third_party\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="..\third_party\imgui\backends\imgui_impl_dx11.cpp" />
+    <ClCompile Include="..\third_party\imgui\backends\imgui_impl_glfw.cpp" />
+    <!-- GLFW (Win32) -->
+    <ClCompile Include="..\third_party\glfw\src\context.c" />
+    <ClCompile Include="..\third_party\glfw\src\init.c" />
+    <ClCompile Include="..\third_party\glfw\src\input.c" />
+    <ClCompile Include="..\third_party\glfw\src\monitor.c" />
+    <ClCompile Include="..\third_party\glfw\src\vulkan.c" />
+    <ClCompile Include="..\third_party\glfw\src\window.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_init.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_joystick.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_monitor.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_thread.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_time.c" />
+    <ClCompile Include="..\third_party\glfw\src\win32_window.c" />
+    <ClCompile Include="..\third_party\glfw\src\wgl_context.c" />
+    <ClCompile Include="..\third_party\glfw\src\egl_context.c" />
+    <ClCompile Include="..\third_party\glfw\src\osmesa_context.c" />
+    <!-- Zydis -->
+    <ClCompile Include="..\third_party\zydis\src\Decoder.c" />
+    <ClCompile Include="..\third_party\zydis\src\DecoderData.c" />
+    <ClCompile Include="..\third_party\zydis\src\Disassembler.c" />
+    <ClCompile Include="..\third_party\zydis\src\Encoder.c" />
+    <ClCompile Include="..\third_party\zydis\src\EncoderData.c" />
+    <ClCompile Include="..\third_party\zydis\src\Formatter.c" />
+    <ClCompile Include="..\third_party\zydis\src\FormatterATT.c" />
+    <ClCompile Include="..\third_party\zydis\src\FormatterBase.c" />
+    <ClCompile Include="..\third_party\zydis\src\FormatterBuffer.c" />
+    <ClCompile Include="..\third_party\zydis\src\FormatterIntel.c" />
+    <ClCompile Include="..\third_party\zydis\src\MetaInfo.c" />
+    <ClCompile Include="..\third_party\zydis\src\Mnemonic.c" />
+    <ClCompile Include="..\third_party\zydis\src\Register.c" />
+    <ClCompile Include="..\third_party\zydis\src\Segment.c" />
+    <ClCompile Include="..\third_party\zydis\src\SharedData.c" />
+    <ClCompile Include="..\third_party\zydis\src\String.c">
+      <ObjectFileName>$(IntDir)zydis_String.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="..\third_party\zydis\src\Utils.c" />
+    <ClCompile Include="..\third_party\zydis\src\Zydis.c" />
+    <!-- Zycore -->
+    <ClCompile Include="..\third_party\zycore\src\Allocator.c" />
+    <ClCompile Include="..\third_party\zycore\src\ArgParse.c" />
+    <ClCompile Include="..\third_party\zycore\src\Bitset.c" />
+    <ClCompile Include="..\third_party\zycore\src\Format.c" />
+    <ClCompile Include="..\third_party\zycore\src\List.c" />
+    <ClCompile Include="..\third_party\zycore\src\String.c">
+      <ObjectFileName>$(IntDir)zycore_String.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="..\third_party\zycore\src\Vector.c" />
+    <ClCompile Include="..\third_party\zycore\src\Zycore.c" />
+    <ClCompile Include="..\third_party\zycore\src\API\Memory.c" />
+    <ClCompile Include="..\third_party\zycore\src\API\Process.c" />
+    <ClCompile Include="..\third_party\zycore\src\API\Synchronization.c" />
+    <ClCompile Include="..\third_party\zycore\src\API\Terminal.c" />
+    <ClCompile Include="..\third_party\zycore\src\API\Thread.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Imno.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Imno.ico" />
+    <Image Include="small.ico" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

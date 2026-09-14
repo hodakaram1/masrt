@@ -1,0 +1,32 @@
+# Build output
+x64/
+x86/
+ARM/
+ARM64/
+Debug/
+Release/
+bin/
+obj/
+
+# Visual Studio intermediates
+*.obj
+*.pdb
+*.ilk
+*.res
+*.idb
+*.recipe
+*.tlog
+*.lastbuildstate
+*.FileListAbsolute.txt
+*.log
+build_error.log
+
+# Driver packaging
+*.cat
+*.cab
+*.cer
+disk1/
+
+# IDE
+.vs/
+*.user

@@ -1,0 +1,10 @@
+; Diamond Directive File for packaging DBK64 driver files into a cabinet.
+; Used by the "Release|x64" post-build step (makecab).
+.Set CabinetNameTemplate=dbk64.cab
+.Set DiskDirectoryTemplate=disk1
+.Set CompressionType=MSZIP
+.Set MaxDiskSize=CDROM
+.Set Cabinet=on
+.Set Compress=on
+"DBK64.sys"
+"DBK64.cat"
