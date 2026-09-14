@@ -1,5 +1,6 @@
 #include "Imno.h"
 #include "MemoryView.h"
+#include "Version.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -409,7 +410,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     }
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Imno - DBK64 (Kernel Only)", NULL, NULL);
+    char winTitle[128];
+    sprintf_s(winTitle, "Imno %s - DBK64 (Kernel Only)", IMNO_VERSION_STRING);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, winTitle, NULL, NULL);
     if (!window) { glfwTerminate(); return 1; }
     g_Window = window; g_hWnd = glfwGetWin32Window(window);
 
@@ -439,7 +442,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         if (fbWidth == 0 || fbHeight == 0) { Sleep(10); continue; }
         ImGui_ImplDX11_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always); ImGui::SetNextWindowSize(ImVec2((float)fbWidth, (float)fbHeight), ImGuiCond_Always);
-        ImGui::Begin("Imno - DBK64 (Kernel Only)", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
+        char mainTitle[128];
+        sprintf_s(mainTitle, "Imno %s - DBK64 (Kernel Only) - Scanner Normal + Memory View CE Full", IMNO_VERSION_STRING);
+        ImGui::Begin(mainTitle, NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) ImGui::TextColored({0.0f, 1.0f, 0.0f, 1.0f}, "[DBK64 Driver: ACTIVE] [KERNEL MODE]");
