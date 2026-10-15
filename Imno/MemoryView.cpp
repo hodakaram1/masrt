@@ -721,7 +721,6 @@ void MemoryView_Init() {
 void MemoryView_Shutdown() {
     s_MemViewActive = false;
 }
-}
 
 void MemoryView_OnPidChanged(ULONG newPid, bool is64) {
     g_MemView.is64BitMode = is64;
