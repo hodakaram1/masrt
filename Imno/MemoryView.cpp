@@ -12,6 +12,12 @@
 
 MemViewState g_MemView;
 
+static std::mutex s_StringsMutex;
+static std::atomic<bool> s_IsScanningStrings(false);
+static std::mutex s_SearchMutex;
+static std::atomic<bool> s_IsSearching(false);
+static std::atomic<bool> s_MemViewActive(true);
+
 // Helpers
 static bool IsHexChar(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
@@ -69,7 +75,7 @@ bool MemoryView_ParseAddress(const char* str, ULONG pid, ULONG_PTR* outAddr) {
         offPart.erase(offPart.find_last_not_of(" \t") + 1);
         ULONG_PTR off = 0;
         try {
-            off = (ULONG_PTR)std::stoull(offPart, nullptr, 0);
+            off = (ULONG_PTR)std::stoull(offPart, nullptr, 16);
         } catch (...) { off = 0; }
         // Find module base
         for (auto& m : g_MemView.modules) {
@@ -88,18 +94,16 @@ bool MemoryView_ParseAddress(const char* str, ULONG pid, ULONG_PTR* outAddr) {
                 }
             }
         }
-        // Fallback: treat modPart as address itself? No
-        // Try parsing modPart as hex and add offset
+        // Fallback: treat modPart as address itself
         ULONG_PTR base = 0;
-        try { base = (ULONG_PTR)std::stoull(modPart, nullptr, 0); } catch (...) { return false; }
+        try { base = (ULONG_PTR)std::stoull(modPart, nullptr, 16); } catch (...) { return false; }
         *outAddr = base + off;
         return true;
     }
 
     // Plain hex / dec
     try {
-        // Remove 0x prefix handled by stoull with base 0
-        ULONG_PTR v = (ULONG_PTR)std::stoull(s, nullptr, 0);
+        ULONG_PTR v = (ULONG_PTR)std::stoull(s, nullptr, 16);
         *outAddr = v;
         return true;
     } catch (...) {
@@ -313,7 +317,7 @@ void MemoryView_RefreshRegions() {
         r.size = length;
         r.protect = prot;
         strcpy_s(r.protectStr, sizeof(r.protectStr), MemoryView_ProtectToString(prot));
-        r.readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+        r.readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         r.writable = (prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         r.executable = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         strcpy_s(r.stateStr, sizeof(r.stateStr), "COMMIT");
@@ -509,22 +513,34 @@ void MemoryView_RefreshModules() {
 }
 
 void MemoryView_ScanStrings() {
-    g_MemView.strings.clear();
-    if (g_SelectedPid == 0 || g_hDriver == INVALID_HANDLE_VALUE) return;
-    if (g_MemView.regions.empty()) MemoryView_RefreshRegions();
+    if (s_IsScanningStrings.exchange(true)) return;
+    if (g_SelectedPid == 0 || g_hDriver == INVALID_HANDLE_VALUE) {
+        s_IsScanningStrings = false;
+        return;
+    }
+
+    std::vector<MemRegionFull> regionsCopy;
+    {
+        if (g_MemView.regions.empty()) MemoryView_RefreshRegions();
+        regionsCopy = g_MemView.regions;
+    }
 
     int minLen = g_MemView.stringMinLen;
     if (minLen < 3) minLen = 3;
 
+    std::vector<StringRef> localStrings;
+    localStrings.reserve(2048);
+
     std::vector<BYTE> buf(4096);
-    for (auto& r : g_MemView.regions) {
+    for (auto& r : regionsCopy) {
+        if (!s_MemViewActive.load()) break;
         if (!r.readable) continue;
-        if (r.size > 0x1000000) continue; // skip huge regions for performance (optional)
+        if (r.size > 0x1000000) continue; // skip huge regions for performance
         ULONG_PTR cur = r.base;
         ULONG_PTR end = r.base + r.size;
         std::string curStr;
         ULONG_PTR curStrStart = 0;
-        while (cur < end) {
+        while (cur < end && s_MemViewActive.load()) {
             ULONG_PTR toRead = std::min<ULONG_PTR>(buf.size(), end - cur);
             if (!DbkReadBytes(g_SelectedPid, cur, buf.data(), (ULONG)toRead)) { cur += toRead; curStr.clear(); continue; }
             for (ULONG_PTR i = 0; i < toRead; i++) {
@@ -538,8 +554,8 @@ void MemoryView_ScanStrings() {
                         sr.address = curStrStart;
                         sr.length = (int)curStr.size();
                         strncpy_s(sr.text, curStr.c_str(), sizeof(sr.text)-1);
-                        g_MemView.strings.push_back(sr);
-                        if (g_MemView.strings.size() > 10000) goto done; // limit
+                        localStrings.push_back(sr);
+                        if (localStrings.size() >= 10000) goto scan_strings_done;
                     }
                     curStr.clear();
                 }
@@ -552,25 +568,35 @@ void MemoryView_ScanStrings() {
             sr.address = curStrStart;
             sr.length = (int)curStr.size();
             strncpy_s(sr.text, curStr.c_str(), sizeof(sr.text)-1);
-            g_MemView.strings.push_back(sr);
+            localStrings.push_back(sr);
+            if (localStrings.size() >= 10000) goto scan_strings_done;
         }
     }
-done:
-    g_MemView.stringsNeedScan = false;
+scan_strings_done:
+    {
+        std::lock_guard<std::mutex> lock(s_StringsMutex);
+        g_MemView.strings = std::move(localStrings);
+        g_MemView.stringsNeedScan = false;
+    }
+    s_IsScanningStrings = false;
 }
 
 // Pattern search with wildcards: "48 8B 05 ? ? ? ?" or "48 8B ??"
 void MemoryView_SearchPattern(const char* pattern) {
-    g_MemView.searchResults.clear();
-    if (!pattern || !pattern[0] || g_SelectedPid == 0) return;
+    if (s_IsSearching.exchange(true)) return;
     g_MemView.isSearching = true;
     g_MemView.searchProgress = 0;
+
+    if (!pattern || !pattern[0] || g_SelectedPid == 0 || g_hDriver == INVALID_HANDLE_VALUE) {
+        g_MemView.isSearching = false;
+        s_IsSearching = false;
+        return;
+    }
 
     // Parse pattern into bytes and mask
     std::vector<BYTE> patBytes;
     std::vector<bool> patMask; // true = must match, false = wildcard
     std::string patStr = pattern;
-    // Tokenize by space
     std::istringstream iss(patStr);
     std::string token;
     while (iss >> token) {
@@ -578,7 +604,6 @@ void MemoryView_SearchPattern(const char* pattern) {
             patBytes.push_back(0);
             patMask.push_back(false);
         } else {
-            // hex byte
             try {
                 int v = std::stoi(token, nullptr, 16);
                 patBytes.push_back((BYTE)v);
@@ -588,39 +613,57 @@ void MemoryView_SearchPattern(const char* pattern) {
             }
         }
     }
-    if (patBytes.empty()) { g_MemView.isSearching = false; return; }
+    if (patBytes.empty()) {
+        g_MemView.isSearching = false;
+        s_IsSearching = false;
+        return;
+    }
 
-    if (g_MemView.regions.empty()) MemoryView_RefreshRegions();
+    std::vector<MemRegionFull> regionsCopy;
+    {
+        if (g_MemView.regions.empty()) MemoryView_RefreshRegions();
+        regionsCopy = g_MemView.regions;
+    }
+
+    std::vector<ULONG_PTR> localResults;
+    localResults.reserve(1024);
 
     std::vector<BYTE> buf(65536);
-    size_t totalRegions = g_MemView.regions.size();
+    size_t totalRegions = regionsCopy.size();
     size_t curRegion = 0;
-    for (auto& r : g_MemView.regions) {
+    for (auto& r : regionsCopy) {
+        if (!s_MemViewActive.load()) break;
         curRegion++;
-        g_MemView.searchProgress = (int)(curRegion * 100 / totalRegions);
+        g_MemView.searchProgress = totalRegions ? (int)(curRegion * 100 / totalRegions) : 100;
         if (!r.readable) continue;
         if (r.size < patBytes.size()) continue;
         ULONG_PTR cur = r.base;
         ULONG_PTR end = r.base + r.size;
-        while (cur < end) {
+        while (cur < end && s_MemViewActive.load()) {
             ULONG_PTR toRead = std::min<ULONG_PTR>(buf.size(), end - cur);
             if (!DbkReadBytes(g_SelectedPid, cur, buf.data(), (ULONG)toRead)) { cur += toRead; continue; }
-            // Search in buf
             for (size_t i = 0; i + patBytes.size() <= toRead; i++) {
                 bool match = true;
                 for (size_t j = 0; j < patBytes.size(); j++) {
                     if (patMask[j] && buf[i + j] != patBytes[j]) { match = false; break; }
                 }
                 if (match) {
-                    g_MemView.searchResults.push_back(cur + i);
-                    if (g_MemView.searchResults.size() > 10000) { g_MemView.isSearching = false; g_MemView.searchProgress = 100; return; }
+                    localResults.push_back(cur + i);
+                    if (localResults.size() >= 10000) goto search_done;
                 }
             }
-            cur += toRead;
+            ULONG_PTR advance = (toRead > patBytes.size()) ? (toRead - (patBytes.size() - 1)) : toRead;
+            cur += advance;
         }
     }
-    g_MemView.isSearching = false;
+search_done:
+    {
+        std::lock_guard<std::mutex> lock(s_SearchMutex);
+        g_MemView.searchResults = std::move(localResults);
+    }
     g_MemView.searchProgress = 100;
+    g_MemView.isSearching = false;
+    s_IsSearching = false;
 }
 
 // ------------------------------------------------------------------
@@ -651,6 +694,9 @@ void MemoryView_GoToHex(ULONG_PTR addr) {
 // Init / Shutdown / PID change
 // ------------------------------------------------------------------
 void MemoryView_Init() {
+    s_MemViewActive = true;
+    s_IsScanningStrings = false;
+    s_IsSearching = false;
     g_MemView = MemViewState(); // reset via default ctor
     g_MemView.disasmAddr = 0x00400000;
     g_MemView.hexAddr = 0x00400000;
@@ -673,7 +719,8 @@ void MemoryView_Init() {
 }
 
 void MemoryView_Shutdown() {
-    // nothing
+    s_MemViewActive = false;
+}
 }
 
 void MemoryView_OnPidChanged(ULONG newPid, bool is64) {
@@ -740,7 +787,7 @@ static void RenderDisasmLine(const DisasmLine& line, int idx, bool isSelected) {
             MemoryView_GoToHex(line.address);
         }
         if (ImGui::MenuItem("Add to Cheat Table")) {
-            std::lock_guard<std::mutex> lock(g_CheatTableLock);
+            std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
             char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)line.address);
             CheatItem ni{}; ni.Address = line.address; ni.BaseAddress = line.address; ni.RealAddress = line.address; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
         }
@@ -951,7 +998,7 @@ void MemoryView_Render() {
                                 MemoryView_GoTo(rowAddr + c);
                             }
                             if (ImGui::MenuItem("Add to Cheat Table")) {
-                                std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                                std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                                 char desc[64]; sprintf_s(desc, "0x%llX", (unsigned long long)(rowAddr + c));
                                 CheatItem ni{}; ni.Address = rowAddr + c; ni.BaseAddress = rowAddr + c; ni.RealAddress = rowAddr + c; ni.Value64 = b; ni.Enabled = false; ni.DataType = 3; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); FormatValueToString(ni.Value64, ni.DataType, ni.FrozenValueStr, sizeof(ni.FrozenValueStr)); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
                             }
@@ -1126,44 +1173,57 @@ void MemoryView_Render() {
             ImGui::SetNextItemWidth(100);
             ImGui::InputInt("Min Length", &g_MemView.stringMinLen);
             ImGui::SameLine();
-            if (ImGui::Button("Scan Strings")) {
-                g_MemView.stringsNeedScan = true;
-                std::thread([](){ MemoryView_ScanStrings(); }).detach();
+            bool scanning = s_IsScanningStrings.load();
+            if (scanning) {
+                ImGui::TextDisabled("Scanning strings...");
+            } else {
+                if (ImGui::Button("Scan Strings")) {
+                    g_MemView.stringsNeedScan = true;
+                    std::thread([](){ MemoryView_ScanStrings(); }).detach();
+                }
             }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(150);
             ImGui::InputText("Filter", g_MemView.stringFilter, sizeof(g_MemView.stringFilter));
             ImGui::SameLine();
-            ImGui::TextDisabled("%zu strings", g_MemView.strings.size());
+            size_t stringCount = 0;
+            {
+                std::lock_guard<std::mutex> lock(s_StringsMutex);
+                stringCount = g_MemView.strings.size();
+            }
+            ImGui::TextDisabled("%zu strings", stringCount);
 
-            if (g_MemView.stringsNeedScan && g_MemView.strings.empty()) {
+            if (g_MemView.stringsNeedScan && stringCount == 0 && !scanning) {
                 ImGui::TextDisabled("No strings scanned yet. Click Scan Strings.");
             }
 
             ImGui::BeginChild("StringsChild", ImVec2(0, 0), true);
-            ImGuiListClipper clipper;
-            clipper.Begin((int)g_MemView.strings.size());
-            while (clipper.Step()) {
-                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
-                    auto& s = g_MemView.strings[i];
-                    if (g_MemView.stringFilter[0] && !StrContainsCI(s.text, g_MemView.stringFilter)) continue;
-                    ImGui::PushID(i);
-                    char label[256];
-                    sprintf_s(label, "0x%08llX : %s", (unsigned long long)s.address, s.text);
-                    if (ImGui::Selectable(label)) {
-                        MemoryView_GoTo(s.address);
-                    }
-                    if (ImGui::BeginPopupContextItem()) {
-                        if (ImGui::MenuItem("Go to Disasm")) MemoryView_GoTo(s.address);
-                        if (ImGui::MenuItem("Go to Hex")) MemoryView_GoToHex(s.address);
-                        if (ImGui::MenuItem("Copy Address")) {
-                            char buf[32]; sprintf_s(buf, "0x%llX", (unsigned long long)s.address);
-                            ImGui::SetClipboardText(buf);
+            {
+                std::lock_guard<std::mutex> lock(s_StringsMutex);
+                ImGuiListClipper clipper;
+                clipper.Begin((int)g_MemView.strings.size());
+                while (clipper.Step()) {
+                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                        auto& s = g_MemView.strings[i];
+                        if (g_MemView.stringFilter[0] && !StrContainsCI(s.text, g_MemView.stringFilter)) continue;
+                        ImGui::PushID(i);
+                        char label[256];
+                        sprintf_s(label, "0x%08llX : %s", (unsigned long long)s.address, s.text);
+                        if (ImGui::Selectable(label)) {
+                            MemoryView_GoTo(s.address);
                         }
-                        if (ImGui::MenuItem("Copy String")) ImGui::SetClipboardText(s.text);
-                        ImGui::EndPopup();
+                        if (ImGui::BeginPopupContextItem()) {
+                            if (ImGui::MenuItem("Go to Disasm")) MemoryView_GoTo(s.address);
+                            if (ImGui::MenuItem("Go to Hex")) MemoryView_GoToHex(s.address);
+                            if (ImGui::MenuItem("Copy Address")) {
+                                char buf[32]; sprintf_s(buf, "0x%llX", (unsigned long long)s.address);
+                                ImGui::SetClipboardText(buf);
+                            }
+                            if (ImGui::MenuItem("Copy String")) ImGui::SetClipboardText(s.text);
+                            ImGui::EndPopup();
+                        }
+                        ImGui::PopID();
                     }
-                    ImGui::PopID();
                 }
             }
             ImGui::EndChild();
@@ -1224,13 +1284,16 @@ void MemoryView_Render() {
             ImGui::InputText("Pattern", g_MemView.searchPatternInput, sizeof(g_MemView.searchPatternInput));
             ImGui::SameLine();
             if (ImGui::Button("Search")) {
-                std::thread([pat = std::string(g_MemView.searchPatternInput)](){ MemoryView_SearchPattern(pat.c_str()); }).detach();
+                if (!s_IsSearching.load()) {
+                    std::thread([pat = std::string(g_MemView.searchPatternInput)](){ MemoryView_SearchPattern(pat.c_str()); }).detach();
+                }
             }
             if (g_MemView.isSearching) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("Searching... %d%%", g_MemView.searchProgress);
                 ImGui::ProgressBar(g_MemView.searchProgress / 100.0f, ImVec2(200, 0));
             } else {
+                std::lock_guard<std::mutex> lock(s_SearchMutex);
                 if (!g_MemView.searchResults.empty()) {
                     ImGui::Text("Found %zu results:", g_MemView.searchResults.size());
                     ImGui::BeginChild("SearchResultsChild", ImVec2(0, 150), true);

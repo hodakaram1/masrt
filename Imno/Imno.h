@@ -295,7 +295,7 @@ extern std::vector<ProcessInfo> g_ProcessList;
 extern ULONG g_SelectedPid;
 extern bool g_SelectedIs64;
 extern std::vector<CheatItem> g_CheatTable;
-extern std::mutex g_CheatTableLock;
+extern std::recursive_mutex g_CheatTableLock;
 
 // Freeze speed + trigger globals (user requested GUI control)
 extern std::atomic<int>  g_FreezeIntervalMs;      // speed control 10-2000ms, default 50

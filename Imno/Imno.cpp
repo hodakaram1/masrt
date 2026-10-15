@@ -40,7 +40,7 @@ bool                   g_SelectedIs64 = true;
 
 // Cheat Table & Freeze - CE clone + speed + trigger
 std::vector<CheatItem> g_CheatTable;
-std::mutex g_CheatTableLock;
+std::recursive_mutex g_CheatTableLock;
 std::atomic<bool> g_FreezeRunning(true);
 std::thread g_FreezeThread;
 
@@ -379,9 +379,6 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
     if (item.Pid == 0) return;
     if (g_hDriver == INVALID_HANDLE_VALUE) return;
 
-    // Check per-item trigger filter (unless manual trigger ignoring filter)
-    // This check is also done in FreezeLoop, but keep for safety when called directly
-    // For OnHotkey, we check global key state outside, but here we still allow if Always
     if (item.Trigger == CEFreezeTrigger::Once && item.OneShotDone) return;
 
     ULONG_PTR realAddr = 0;
@@ -389,15 +386,13 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
         return;
     }
 
-    // For AllowIncrease/Decrease and OnValueChanged we need current value
-    bool needRead = (item.FreezeType != CEFreezeType::Frozen) || (item.Trigger == CEFreezeTrigger::OnValueChanged);
-
+    // Always read current value from memory so UI and comparisons have live data
     ULONG64 currentVal = 0;
     float currentFloat = 0.0f;
     double currentDouble = 0.0;
     bool hasCurrent = false;
 
-    if (needRead) {
+    {
         ULONG64 v = 0;
         ULONG sz = GetDataSize(item.DataType);
         if (DbkReadBytes(item.Pid, realAddr, &v, sz)) {
@@ -410,11 +405,9 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
                 memcpy(&currentDouble, &v, sizeof(double));
             }
             item.LastSeenValue = v;
+            FormatValueToString(v, item.DataType, item.CurrentValueStr, sizeof(item.CurrentValueStr));
         } else {
-            if (item.FreezeType != CEFreezeType::Frozen && item.Trigger != CEFreezeTrigger::OnValueChanged) {
-                // For Allow modes, if can't read skip
-                if (item.FreezeType != CEFreezeType::Frozen) return;
-            }
+            if (item.FreezeType != CEFreezeType::Frozen) return;
         }
     }
 
@@ -436,11 +429,15 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
             } else if (item.DataType == 5) {
                 double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
                 shouldWrite = fabs(currentDouble - frozenD) > 0.001;
+            } else if (item.DataType == 3) {
+                shouldWrite = (uint8_t)currentVal != (uint8_t)item.Value64;
+            } else if (item.DataType == 2) {
+                shouldWrite = (uint16_t)currentVal != (uint16_t)item.Value64;
+            } else if (item.DataType == 4) {
+                shouldWrite = (uint32_t)currentVal != (uint32_t)item.Value64;
             } else {
                 shouldWrite = currentVal != item.Value64;
             }
-            // Then still apply FreezeType filter below if needed? For OnValueChanged we want exact freeze when changed
-            // So if shouldWrite true, we will write, but also respect Allow modes
             if (!shouldWrite) return;
             break;
         case CEFreezeTrigger::Once:
@@ -449,7 +446,7 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
             break;
     }
 
-    // FreezeType logic (ftFrozen / AllowIncrease / AllowDecrease)
+    // FreezeType logic (ftFrozen / AllowIncrease / AllowDecrease) with proper signed comparisons
     bool freezeTypeAllows = false;
     switch (item.FreezeType) {
         case CEFreezeType::Frozen:
@@ -463,8 +460,14 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
             } else if (item.DataType == 5) {
                 double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
                 freezeTypeAllows = currentDouble < frozenD;
+            } else if (item.DataType == 3) {
+                freezeTypeAllows = (int8_t)currentVal < (int8_t)item.Value64;
+            } else if (item.DataType == 2) {
+                freezeTypeAllows = (int16_t)currentVal < (int16_t)item.Value64;
+            } else if (item.DataType == 4) {
+                freezeTypeAllows = (int32_t)currentVal < (int32_t)item.Value64;
             } else {
-                freezeTypeAllows = currentVal < item.Value64;
+                freezeTypeAllows = (int64_t)currentVal < (int64_t)item.Value64;
             }
             break;
         }
@@ -476,8 +479,14 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
             } else if (item.DataType == 5) {
                 double frozenD; memcpy(&frozenD, &item.Value64, sizeof(double));
                 freezeTypeAllows = currentDouble > frozenD;
+            } else if (item.DataType == 3) {
+                freezeTypeAllows = (int8_t)currentVal > (int8_t)item.Value64;
+            } else if (item.DataType == 2) {
+                freezeTypeAllows = (int16_t)currentVal > (int16_t)item.Value64;
+            } else if (item.DataType == 4) {
+                freezeTypeAllows = (int32_t)currentVal > (int32_t)item.Value64;
             } else {
-                freezeTypeAllows = currentVal > item.Value64;
+                freezeTypeAllows = (int64_t)currentVal > (int64_t)item.Value64;
             }
             break;
         }
@@ -485,7 +494,6 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
 
     // Combine trigger + freeze type
     if (item.Trigger == CEFreezeTrigger::OnValueChanged) {
-        // already filtered, but still need freeze type allows if not Frozen
         if (item.FreezeType != CEFreezeType::Frozen) shouldWrite = freezeTypeAllows;
         else shouldWrite = true;
     } else {
@@ -496,8 +504,6 @@ void ApplyFreezeForItem(CheatItem& item, bool is64) {
         WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
         if (item.Trigger == CEFreezeTrigger::Once) {
             item.OneShotDone = true;
-            // Auto-disable after once? Keep enabled but mark done, or disable
-            // We auto-disable to mimic CE one-shot
             item.Enabled = false;
         }
         item.LastTriggerTick = GetTickCount64();
@@ -509,7 +515,7 @@ void TriggerFreezeNow(bool ignoreTriggerFilter) {
     if (g_hDriver == INVALID_HANDLE_VALUE) return;
     std::vector<CheatItem> copy;
     {
-        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+        std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
         copy = g_CheatTable;
     }
     bool is64 = g_SelectedIs64;
@@ -518,48 +524,38 @@ void TriggerFreezeNow(bool ignoreTriggerFilter) {
         if (!item.Enabled && !ignoreTriggerFilter) continue;
         if (item.Pid == 0) continue;
         if (!ignoreTriggerFilter) {
-            // If ManualOnly trigger, only trigger those with ManualOnly or Always? We trigger all enabled when manual button pressed
-            // For manual trigger, we want to trigger all enabled regardless of per-item trigger, except Once already done
             if (item.Trigger == CEFreezeTrigger::Once && item.OneShotDone) continue;
         }
-        // For manual trigger, we bypass per-item Trigger check except Once
-        // Call Apply but with forced write for ManualOnly items
         ULONG_PTR realAddr = 0;
-        // Use GetRealAddressForItem on copy item (need mutable)
         if (!GetRealAddressForItem(item, is64, &realAddr)) continue;
-        // Direct write ignoring FreezeType for manual trigger? No, respect FreezeType but force
-        // Simplest: call ApplyFreezeForItem which respects FreezeType
-        // For manual trigger we want to force write even if AllowIncrease condition not met, so we write directly
         if (ignoreTriggerFilter) {
             WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
+            item.LastTriggerTick = GetTickCount64();
             triggered++;
         } else {
-            // Use Apply logic but ensure ManualOnly items get written
             if (item.Trigger == CEFreezeTrigger::ManualOnly) {
                 WriteMemory(item.Pid, realAddr, item.Value64, item.DataType);
                 item.LastTriggerTick = GetTickCount64();
                 triggered++;
-                if (item.Trigger == CEFreezeTrigger::Once) {
-                    item.OneShotDone = true;
-                    item.Enabled = false;
-                }
             } else {
-                // For Always/OnHotkey/OnValueChanged, use normal Apply
                 ApplyFreezeForItem(item, is64);
                 triggered++;
             }
         }
     }
-    // Update back
+    // Update back safely matching by address
     {
-        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+        std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
         for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
-            g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
-            g_CheatTable[i].RealAddress = copy[i].RealAddress;
-            g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
-            g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
-            if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
-                g_CheatTable[i].Enabled = false;
+            if (g_CheatTable[i].Address == copy[i].Address) {
+                g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
+                g_CheatTable[i].RealAddress = copy[i].RealAddress;
+                g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
+                g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
+                strcpy_s(g_CheatTable[i].CurrentValueStr, sizeof(g_CheatTable[i].CurrentValueStr), copy[i].CurrentValueStr);
+                if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
+                    g_CheatTable[i].Enabled = false;
+                }
             }
         }
     }
@@ -568,7 +564,7 @@ void TriggerFreezeNow(bool ignoreTriggerFilter) {
 
 void TriggerFreezeSingle(int index) {
     if (g_hDriver == INVALID_HANDLE_VALUE) return;
-    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+    std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
     if (index < 0 || index >= (int)g_CheatTable.size()) return;
     auto& item = g_CheatTable[index];
     if (item.Pid == 0) return;
@@ -597,20 +593,20 @@ void FreezeLoop() {
             if (mode == (int)CEFreezeMode::Continuous) {
                 doFreeze = true;
             } else if (mode == (int)CEFreezeMode::ManualOnly) {
-                doFreeze = manualPulse; // only when manual trigger button pressed
+                doFreeze = manualPulse;
             } else if (mode == (int)CEFreezeMode::WhileKeyPressed) {
                 int vk = g_FreezeTriggerKey.load();
                 if (vk != 0 && (GetAsyncKeyState(vk) & 0x8000)) {
                     doFreeze = true;
                 } else {
-                    doFreeze = manualPulse; // allow manual pulse even in this mode
+                    doFreeze = manualPulse;
                 }
             }
 
             if (doFreeze) {
                 std::vector<CheatItem> copy;
                 {
-                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                     copy = g_CheatTable;
                 }
                 bool is64 = g_SelectedIs64;
@@ -620,9 +616,7 @@ void FreezeLoop() {
 
                     // Per-item trigger filtering
                     if (item.Trigger == CEFreezeTrigger::ManualOnly) {
-                        // In Continuous mode, ManualOnly items should NOT auto-freeze, only on manual trigger
                         if (mode == (int)CEFreezeMode::Continuous && !manualPulse) continue;
-                        // In ManualOnly mode, they freeze when manualPulse (already doFreeze true)
                     } else if (item.Trigger == CEFreezeTrigger::OnHotkey) {
                         int vk = g_FreezeTriggerKey.load();
                         if (vk == 0) continue;
@@ -630,19 +624,21 @@ void FreezeLoop() {
                     } else if (item.Trigger == CEFreezeTrigger::Once) {
                         if (item.OneShotDone) continue;
                     }
-                    // Always and OnValueChanged are handled inside ApplyFreezeForItem
 
                     ApplyFreezeForItem(item, is64);
                 }
                 {
-                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                     for (size_t i = 0; i < g_CheatTable.size() && i < copy.size(); i++) {
-                        g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
-                        g_CheatTable[i].RealAddress = copy[i].RealAddress;
-                        g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
-                        g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
-                        if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
-                            g_CheatTable[i].Enabled = false;
+                        if (g_CheatTable[i].Address == copy[i].Address) {
+                            g_CheatTable[i].LastSeenValue = copy[i].LastSeenValue;
+                            g_CheatTable[i].RealAddress = copy[i].RealAddress;
+                            g_CheatTable[i].LastTriggerTick = copy[i].LastTriggerTick;
+                            g_CheatTable[i].OneShotDone = copy[i].OneShotDone;
+                            strcpy_s(g_CheatTable[i].CurrentValueStr, sizeof(g_CheatTable[i].CurrentValueStr), copy[i].CurrentValueStr);
+                            if (copy[i].Trigger == CEFreezeTrigger::Once && copy[i].OneShotDone) {
+                                g_CheatTable[i].Enabled = false;
+                            }
                         }
                     }
                 }
@@ -656,10 +652,8 @@ void FreezeLoop() {
         if (interval < 10) interval = 10;
         if (interval > 5000) interval = 5000;
 
-        // Sleep for interval, but check for early exit every 10ms
         ULONGLONG target = GetTickCount64() + interval;
         while (g_FreezeRunning && GetTickCount64() < target) {
-            // If manual trigger requested and mode is ManualOnly, break early to trigger immediately
             if (g_FreezeManualTrigger.load() && g_FreezeMode.load() == (int)CEFreezeMode::ManualOnly) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -695,7 +689,11 @@ void RefreshProcessList()
 struct RegionInfo { ULONG_PTR Start; ULONG_PTR End; };
 static ULONG_PTR MaxAddr(ULONG_PTR a, ULONG_PTR b) { return a > b ? a : b; }
 static ULONG_PTR MinAddr(ULONG_PTR a, ULONG_PTR b) { return a < b ? a : b; }
-static bool IsReadableProtectKernel(DWORD protect) { return (protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE); }
+static bool IsReadableProtectKernel(DWORD protect) {
+    if (protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
 static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd) {
     std::vector<RegionInfo> regions; if (g_hDriver == INVALID_HANDLE_VALUE) return regions;
     ULONG_PTR cursor = rangeStart & ~(ULONG_PTR)0xFFF; ULONG guard = 0;
@@ -714,7 +712,10 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
     g_IsScanning = true; g_ScanProgress = 0; g_ScanTruncated = false;
     { std::lock_guard<std::mutex> lock(g_ScanResultsLock); g_ScanResults.clear(); }
     if (g_hDriver == INVALID_HANDLE_VALUE || targetPid == 0) { g_ScanVersion++; g_IsScanning = false; return; }
-    ULONG sz = GetDataSize(dataType); ULONG_PTR rStart = useRange ? rangeStart : 0x10000; ULONG_PTR rEnd = useRange ? rangeEnd : 0x7FFFFFFFFFFFULL;
+    ULONG sz = GetDataSize(dataType);
+    ULONG_PTR defaultEnd = g_SelectedIs64 ? 0x7FFFFFFFFFFFULL : 0x7FFFFFFFULL;
+    ULONG_PTR rStart = useRange ? rangeStart : 0x10000;
+    ULONG_PTR rEnd = useRange ? rangeEnd : defaultEnd;
     std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
     std::vector<ULONG_PTR> results; std::vector<BYTE> chunk(DBK_MAX_IO_SIZE); ULONG64 totalBytes = 0, doneBytes = 0;
     for (auto& r : regions) totalBytes += (ULONG64)(r.End - r.Start);
@@ -728,7 +729,8 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
                     if (memcmp(&chunk[off], &searchVal64, sz) == 0) { results.push_back(cur + off); if (results.size() >= MAX_SCAN_RESULTS) { g_ScanTruncated = true; goto scan_done; } }
                 }
             }
-            cur += chunkSize; doneBytes += chunkSize; g_ScanProgress = totalBytes ? (int)(doneBytes * 100 / totalBytes) : 100;
+            ULONG advance = (remaining > chunkSize && sz > 1) ? (chunkSize - (sz - 1)) : chunkSize;
+            cur += advance; doneBytes += advance; g_ScanProgress = totalBytes ? (int)(doneBytes * 100 / totalBytes) : 100;
         }
     }
 scan_done:
@@ -747,7 +749,7 @@ void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std
 }
 void StartFirstScan() {
     if (g_SelectedPid == 0 || g_IsScanning) return; ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType); g_ResultsDataType = g_SelectedDataType;
-    ULONG_PTR rStart = 0x10000; ULONG_PTR rEnd = 0x7FFFFFFFFFFFULL; if (g_UseScanRange) { rStart = (ULONG_PTR)_strtoui64(g_ScanRangeStart, NULL, 0); rEnd = (ULONG_PTR)_strtoui64(g_ScanRangeEnd, NULL, 0); }
+    ULONG_PTR rStart = 0x10000; ULONG_PTR rEnd = g_SelectedIs64 ? 0x7FFFFFFFFFFFULL : 0x7FFFFFFFULL; if (g_UseScanRange) { rStart = (ULONG_PTR)_strtoui64(g_ScanRangeStart, NULL, 16); rEnd = (ULONG_PTR)_strtoui64(g_ScanRangeEnd, NULL, 16); }
     std::thread(AsyncFirstScanWorker, g_SelectedPid, g_SelectedDataType, val64, g_UseScanRange, rStart, rEnd, g_AllowUnaligned).detach();
 }
 void StartNextScan() {
@@ -862,7 +864,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 {
                     bool doRefresh = !g_IsScanning && (s_NeedValueRefresh || (GetTickCount64() - s_LastValueRefresh > 400));
                     ImGuiListClipper clipper; clipper.Begin((int)s_DisplayAddrs.size());
-                    while (clipper.Step()) { for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) { if (doRefresh) ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType); char valStr[64]; FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr)); char label[160]; sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i); if (ImGui::Selectable(label)) { std::lock_guard<std::mutex> lock(g_CheatTableLock); char desc[64]; sprintf_s(desc, sizeof(desc), "0x%llX", s_DisplayAddrs[i]); CheatItem ni{}; ni.Address = s_DisplayAddrs[i]; ni.Value64 = s_DisplayVals[i]; ni.Enabled = false; ni.DataType = g_ResultsDataType; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.IsPointer = false; ni.BaseAddress = s_DisplayAddrs[i]; ni.RealAddress = s_DisplayAddrs[i]; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); FormatValueToString(ni.Value64, ni.DataType, ni.FrozenValueStr, sizeof(ni.FrozenValueStr)); FormatValueToString(ni.Value64, ni.DataType, ni.CurrentValueStr, sizeof(ni.CurrentValueStr)); g_CheatTable.push_back(ni); } } }
+                    while (clipper.Step()) { for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) { if (doRefresh) ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType); char valStr[64]; FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr)); char label[160]; sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i); if (ImGui::Selectable(label)) { std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock); char desc[64]; sprintf_s(desc, sizeof(desc), "0x%llX", s_DisplayAddrs[i]); CheatItem ni{}; ni.Address = s_DisplayAddrs[i]; ni.Value64 = s_DisplayVals[i]; ni.Enabled = false; ni.DataType = g_ResultsDataType; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.IsPointer = false; ni.BaseAddress = s_DisplayAddrs[i]; ni.RealAddress = s_DisplayAddrs[i]; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, sizeof(ni.Description), desc); FormatValueToString(ni.Value64, ni.DataType, ni.FrozenValueStr, sizeof(ni.FrozenValueStr)); FormatValueToString(ni.Value64, ni.DataType, ni.CurrentValueStr, sizeof(ni.CurrentValueStr)); g_CheatTable.push_back(ni); } } }
                     if (doRefresh) { s_LastValueRefresh = GetTickCount64(); s_NeedValueRefresh = false; }
                 }
                 ImGui::EndChild(); ImGui::EndTabItem();
@@ -947,16 +949,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Reset OneShot Flags")) {
-                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                         for (auto& it : g_CheatTable) { it.OneShotDone = false; }
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Add Manual Entry")) {
-                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                         CheatItem ni{}; ni.Address = 0; ni.BaseAddress = 0; ni.RealAddress = 0; ni.Value64 = 0; ni.Enabled = false; ni.DataType = 4; ni.Pid = g_SelectedPid; ni.FreezeType = CEFreezeType::Frozen; ni.Trigger = CEFreezeTrigger::Always; ni.IsPointer = false; ni.UpdateInterval = 500; ni.UpdateAllowFlags(); strcpy_s(ni.Description, "New Entry"); strcpy_s(ni.FrozenValueStr, "0"); strcpy_s(ni.CurrentValueStr, "?"); g_CheatTable.push_back(ni);
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button("Clear All")) { std::lock_guard<std::mutex> lock(g_CheatTableLock); g_CheatTable.clear(); }
+                    if (ImGui::Button("Clear All")) { std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock); g_CheatTable.clear(); }
                     ImGui::SameLine();
                     ImGui::TextDisabled("Count: %zu", g_CheatTable.size());
                 }
@@ -966,7 +968,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 // Table
                 ImGui::BeginChild("CheatTableChild", ImVec2(0, 0), true);
                 {
-                    std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                    std::lock_guard<std::recursive_mutex> lock(g_CheatTableLock);
                     if (ImGui::BeginTable("CheatTableCE", 11, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
                         ImGui::TableSetupColumn("Active", ImGuiTableColumnFlags_WidthFixed, 50);
                         ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthFixed, 120);
@@ -1002,7 +1004,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                 char addrStr[64]; sprintf_s(addrStr, "0x%llX", it.IsPointer ? it.BaseAddress : it.Address);
                                 ImGui::SetNextItemWidth(-1);
                                 if (ImGui::InputText("##addr", addrStr, sizeof(addrStr))) {
-                                    ULONG_PTR parsed = (ULONG_PTR)_strtoui64(addrStr, NULL, 0);
+                                    ULONG_PTR parsed = (ULONG_PTR)_strtoui64(addrStr, NULL, 16);
                                     if (it.IsPointer) it.BaseAddress = parsed; else { it.Address = parsed; it.RealAddress = parsed; }
                                 }
                             }
@@ -1023,13 +1025,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                 const char* curName = "4 Bytes";
                                 switch(it.DataType){ case 0: curName="8 Bytes"; break; case 1: curName="Float"; break; case 2: curName="2 Bytes"; break; case 3: curName="1 Byte"; break; case 4: curName="4 Bytes"; break; case 5: curName="Double"; break; }
                                 ImGui::SetNextItemWidth(-1);
+                                auto SetType = [&](int nt) {
+                                    if (it.DataType != nt) {
+                                        it.DataType = nt;
+                                        if (it.FrozenValueStr[0]) it.Value64 = ParseInputToValue(it.FrozenValueStr, nt);
+                                    }
+                                };
                                 if (ImGui::BeginCombo("##type", curName)) {
-                                    if (ImGui::Selectable("1 Byte", it.DataType==3)) it.DataType=3;
-                                    if (ImGui::Selectable("2 Bytes", it.DataType==2)) it.DataType=2;
-                                    if (ImGui::Selectable("4 Bytes", it.DataType==4)) it.DataType=4;
-                                    if (ImGui::Selectable("8 Bytes", it.DataType==0)) it.DataType=0;
-                                    if (ImGui::Selectable("Float", it.DataType==1)) it.DataType=1;
-                                    if (ImGui::Selectable("Double", it.DataType==5)) it.DataType=5;
+                                    if (ImGui::Selectable("1 Byte", it.DataType==3)) SetType(3);
+                                    if (ImGui::Selectable("2 Bytes", it.DataType==2)) SetType(2);
+                                    if (ImGui::Selectable("4 Bytes", it.DataType==4)) SetType(4);
+                                    if (ImGui::Selectable("8 Bytes", it.DataType==0)) SetType(0);
+                                    if (ImGui::Selectable("Float", it.DataType==1)) SetType(1);
+                                    if (ImGui::Selectable("Double", it.DataType==5)) SetType(5);
                                     ImGui::EndCombo();
                                 }
                             }
@@ -1091,7 +1099,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                     if (ImGui::InputText("Off##off", offStr, sizeof(offStr))) {
                                         it.Offsets.clear();
                                         char* ctx=nullptr; char* tok = strtok_s(offStr, ",", &ctx);
-                                        while(tok){ int off = (int)strtol(tok, NULL, 0); it.Offsets.push_back(off); tok = strtok_s(nullptr, ",", &ctx); }
+                                        while(tok){ int off = (int)strtoul(tok, NULL, 16); it.Offsets.push_back(off); tok = strtok_s(nullptr, ",", &ctx); }
                                     }
                                 }
                             }
