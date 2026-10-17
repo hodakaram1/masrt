@@ -10,7 +10,7 @@
 PRTL_GENERIC_TABLE InternalProcessList = NULL;
 
 PEPROCESS WatcherProcess = NULL;
-BOOLEAN ProcessWatcherOpensHandles = TRUE;
+BOOLEAN ProcessWatcherOpensHandles = FALSE;
 
 
 

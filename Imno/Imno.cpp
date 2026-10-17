@@ -101,7 +101,6 @@ char      g_AllocNonPagedSize[64] = "0x1000";
 ULONG64   g_AllocNonPagedAddr = 0;
 char      g_AllocProcessSize[64] = "0x1000";
 ULONG64   g_AllocProcessAddr = 0;
-ULONG64   g_OpenProcessHandle = 0;
 ULONG64   g_PeProcess = 0;
 char      g_KernelStatus[256] = "";
 
@@ -404,6 +403,18 @@ bool LoadAndStartDriver()
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCM);
+
+    // Stealth cleanup: DriverEntry already read A/B/C/D during StartServiceW;
+    // remove them from the registry immediately so no A/B/C/D values remain on disk.
+    HKEY hCleanupKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DBK_SERVICE_REG_KEY, 0, KEY_SET_VALUE, &hCleanupKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hCleanupKey, L"A");
+        RegDeleteValueW(hCleanupKey, L"B");
+        RegDeleteValueW(hCleanupKey, L"C");
+        RegDeleteValueW(hCleanupKey, L"D");
+        RegCloseKey(hCleanupKey);
+    }
+
     return true;
 }
 
@@ -453,19 +464,28 @@ bool ConnectDriver()
         NULL);
 
     if (g_hDriver == INVALID_HANDLE_VALUE) {
+        g_hDriver = CreateFileW(DBK_LEGACY_DEVICE_PATH,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+    }
+
+    if (g_hDriver == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         char etext[512];
         DriverWin32ErrorText(err, etext, sizeof(etext));
         char msg[1024];
         snprintf(msg, sizeof(msg),
-            "Could not open the DBK64 device (%S):\n(error %lu: %s)\n\n"
-            "The driver service started, but opening \\\\.\\DBK64 failed.\n"
+            "Could not open the Stealth Kernel device (%S):\n(error %lu: %s)\n\n"
             "Possible causes:\n"
             "  - The driver did not actually load (see System event log).\n"
             "  - Imno is not running elevated / lacks SeDebugPrivilege (the driver\n"
             "    rejects opens from callers without SeDebugPrivilege).\n"
-            "  - The driver's symbolic link (\\DosDevices\\DBK64) was not created.",
-            DBK_DEVICE_PATH, err, etext);
+            "  - The driver's symbolic link (%S) was not created.",
+            DBK_DEVICE_PATH, err, etext, DBK_SYMLINK_NAME);
         DriverMessage("%s", msg);
         return false;
     }
@@ -473,7 +493,7 @@ bool ConnectDriver()
     g_DriverConnected = true;
     if (!DbkGetVersion(&g_KernelVersion)) {
         g_KernelVersion = 0;
-        DriverMessage("Opened DBK64 but could not read its version.\n"
+        DriverMessage("Opened kernel device but could not read its version.\n"
             "The driver may be an incompatible build. Expected version %u.", DBK_VERSION_EXPECTED);
     }
 
@@ -630,11 +650,10 @@ bool IsTarget64Bit(ULONG pid)
 
     // If this is the currently attached process and we already resolved its bitness,
     // return the cached bitness without opening any user-mode handle.
-    if (pid == g_SelectedPid && g_ConquerTrackedPid == pid)
+    if (pid == g_SelectedPid && (g_ConquerTrackedPid == pid || !g_LoadedModules.empty()))
         return g_SelectedIs64;
 
-    // 1) Stealth Kernel Check (zero handles opened): inspect PE header at 0x400000 (standard 32-bit EXE base)
-    //    or loaded modules via kernel memory reads if the DBK64 driver is connected.
+    // Full Stealth Kernel Mode (zero handles opened): inspect PE headers purely via Ring-0 memory reads.
     if (g_hDriver != INVALID_HANDLE_VALUE) {
         BYTE hdr[512] = { 0 };
         if (DbkReadBytes(pid, 0x400000, hdr, sizeof(hdr)) && hdr[0] == 'M' && hdr[1] == 'Z') {
@@ -659,31 +678,35 @@ bool IsTarget64Bit(ULONG pid)
                 }
             }
         }
+
+        // Walk first executable virtual memory regions via Ring-0 page tables to detect 32-bit vs 64-bit PE
+        ULONG_PTR cursor = 0x10000;
+        for (int step = 0; step < 512 && cursor < 0x7FFFFFFF0000ULL; ++step) {
+            ULONG_PTR length = 0;
+            ULONG protection = 0;
+            if (!DbkQueryVirtualMemory(pid, cursor, &length, &protection) || length == 0)
+                break;
+            ULONG_PTR base = cursor & ~(ULONG_PTR)0xFFF;
+            ULONG_PTR end = base + length;
+            if (end <= base)
+                break;
+            if ((protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE) &&
+                (base & 0xFFFF) == 0) {
+                if (DbkReadBytes(pid, base, hdr, sizeof(hdr)) && hdr[0] == 'M' && hdr[1] == 'Z') {
+                    LONG lfanew = *(LONG*)(hdr + 0x3C);
+                    if (lfanew >= 0x40 && lfanew <= (LONG)(sizeof(hdr) - 32) &&
+                        *(DWORD*)(hdr + lfanew) == IMAGE_NT_SIGNATURE) {
+                        WORD magic = *(WORD*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+                        if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+                        if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) return true;
+                    }
+                }
+            }
+            cursor = end;
+        }
     }
 
-    // Never open a user-mode handle or module snapshot on Conquer.exe
-    if (pid == g_ConquerTrackedPid)
-        return false;
-
-    // 2) User-mode fallback when driver is not loaded
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (h) {
-        BOOL wow64 = FALSE;
-        BOOL ok = IsWow64Process(h, &wow64);
-        CloseHandle(h);
-        if (ok) return !wow64; // not WOW64 => native 64-bit
-    }
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, pid);
-    if (snap != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32W me;
-        me.dwSize = sizeof(me);
-        BOOL has32 = Module32FirstW(snap, &me);
-        CloseHandle(snap);
-        if (has32) return false;
-    }
-
-    return true;
+    return (pid != g_ConquerTrackedPid);
 }
 
 ULONG GetPointerSize(ULONG pid)
@@ -1055,19 +1078,6 @@ bool DbkResumeProcess(ULONG pid)
     return DbkIoctl(IOCTL_CE_RESUMEPROCESS, &pid, sizeof(pid), NULL, 0, NULL);
 }
 
-bool DbkOpenProcessHandle(ULONG pid, ULONG64* handle, UCHAR* special)
-{
-    if (handle) *handle = 0;
-    if (special) *special = 0;
-    DBK_OPENPROCESS_OUT out = {};
-    if (DbkIoctl(IOCTL_CE_OPENPROCESS, &pid, sizeof(pid), &out, sizeof(out))) {
-        if (handle) *handle = out.Handle;
-        if (special) *special = out.Special;
-        return true;
-    }
-    return false;
-}
-
 bool DbkGetPEPROCESS(ULONG pid, ULONG64* out)
 {
     if (out) *out = 0;
@@ -1146,35 +1156,9 @@ void RefreshModules()
         return;
     }
 
-    // When connected to Conquer.exe (or when stealth kernel mode is active and driver is loaded),
-    // enumerate modules purely through kernel memory without opening any user-mode handle.
-    if (g_hDriver != INVALID_HANDLE_VALUE && g_ConquerTrackedPid == g_SelectedPid) {
-        RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
-        return;
-    }
-
-    g_LoadedModules.clear();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_SelectedPid);
-    if (snap == INVALID_HANDLE_VALUE) {
-        if (g_hDriver != INVALID_HANDLE_VALUE)
-            RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
-        return;
-    }
-
-    MODULEENTRY32W me;
-    me.dwSize = sizeof(me);
-    if (Module32FirstW(snap, &me)) {
-        do {
-            ModuleInfo info;
-            memset(&info, 0, sizeof(info));
-            WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, info.ModuleName, (int)sizeof(info.ModuleName) - 1, NULL, NULL);
-            WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, info.FullPath, (int)sizeof(info.FullPath) - 1, NULL, NULL);
-            info.BaseAddress = (ULONG_PTR)me.modBaseAddr;
-            info.Size = me.modBaseSize;
-            g_LoadedModules.push_back(info);
-        } while (Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
+    // Full Stealth Kernel Mode: enumerate modules for ALL processes purely through Ring-0 memory
+    // (DbkQueryVirtualMemory + DbkReadBytes) without opening any user-mode handle or module snapshot.
+    RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
 }
 
 // Parse a PE image header at `baseAddr` purely via DBK64 kernel memory reads (zero handles opened).
@@ -1446,12 +1430,17 @@ void ConnectToProcess(ULONG pid)
         g_ConquerReattachedAfterDelay = false;
     }
 
-    g_SelectedIs64 = IsTarget64Bit(pid);
+    // Full Stealth Kernel Mode attachment: resolve PEPROCESS, CR3, bitness, and modules
+    // purely in Ring-0 without opening any user-mode handle or module snapshot.
     if (g_hDriver != INVALID_HANDLE_VALUE) {
         ULONG64 peProc = 0;
+        ULONG64 cr3 = 0;
         DbkGetPEPROCESS(pid, &peProc);
+        DbkGetCR3(pid, &cr3);
+        g_PeProcess = peProc;
+        g_KernelCR3 = cr3;
     }
-    RefreshModules();
+    RefreshModulesStealth(pid, &g_SelectedIs64);
 }
 
 void ConquerWatchLoop()
@@ -1662,40 +1651,6 @@ static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart,
     return regions;
 }
 
-// User-mode fallback when the kernel walker returns nothing (e.g. querying the
-// kernel page tables is unavailable on this OS build).
-static std::vector<RegionInfo> EnumerateRegionsUserMode(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd)
-{
-    std::vector<RegionInfo> regions;
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!h) return regions;
-
-    MEMORY_BASIC_INFORMATION mbi;
-    ULONG_PTR addr = rangeStart;
-    while (addr < rangeEnd) {
-        SIZE_T queried = VirtualQueryEx(h, (LPCVOID)addr, &mbi, sizeof(mbi));
-        if (!queried) break;
-
-        ULONG_PTR regionEnd = (ULONG_PTR)mbi.BaseAddress + (ULONG_PTR)mbi.RegionSize;
-        bool readable = (mbi.State == MEM_COMMIT) &&
-            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
-            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-
-        if (readable) {
-            ULONG_PTR s = MaxAddr((ULONG_PTR)mbi.BaseAddress, rangeStart);
-            ULONG_PTR e = MinAddr(regionEnd, rangeEnd);
-            if (s < e) regions.push_back({ s, e });
-        }
-
-        if (regionEnd <= (ULONG_PTR)mbi.BaseAddress) break; // overflow guard
-        addr = regionEnd;
-    }
-
-    CloseHandle(h);
-    return regions;
-}
-
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned)
 {
     g_IsScanning = true;
@@ -1717,16 +1672,9 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
     ULONG_PTR rStart = useRange ? rangeStart : 0x10000;
     ULONG_PTR rEnd = useRange ? rangeEnd : defaultEnd;
 
-    ULONG conquerPid = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
-        conquerPid = g_ConquerTrackedPid;
-    }
-
+    // Full Stealth Kernel Mode: enumerate regions exclusively via Ring-0 page table walking
+    // (zero OpenProcess, zero VirtualQueryEx).
     std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
-    // Never fall back to user-mode OpenProcess when scanning Conquer.exe
-    if (regions.empty() && targetPid != conquerPid)
-        regions = EnumerateRegionsUserMode(targetPid, rStart, rEnd);
 
     std::vector<ULONG_PTR> results;
     std::vector<BYTE> chunk(DBK_MAX_IO_SIZE);   // max the driver can read per IOCTL
@@ -1910,7 +1858,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     if (!glfwInit()) return 1;
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Imno - DBK64 Kernel Suite", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Imno", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return 1;
@@ -2064,13 +2012,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             }
         }
 
-        // Top Bar: Driver Status Active/Inactive & Process Combo
+        // Top Bar: Stealth Kernel Mode Status Active/Inactive & Process Combo
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) {
-            ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "[DBK64 Driver: ACTIVE]");
+            ImGui::TextColored({ 0.0f, 1.0f, 0.4f, 1.0f }, "[Stealth Kernel Mode: ACTIVE]");
         }
         else {
-            ImGui::TextColored({ 1.0f, 0.0f, 0.0f, 1.0f }, "[DBK64 Driver: INACTIVE]");
+            ImGui::TextColored({ 1.0f, 0.2f, 0.2f, 1.0f }, "[Stealth Kernel Mode: INACTIVE]");
             ImGui::SameLine();
             if (ImGui::Button("Reconnect")) {
                 LoadAndStartDriver();
@@ -2164,21 +2112,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 s_LastTitleUpdate = nowTick;
                 s_LastTitlePid = g_SelectedPid;
                 char winTitle[256];
-                if (uiConquerPid == g_SelectedPid) {
-                    // Stealth window title: avoid exposing "Conquer.exe" or "DBK64" to window-title scanners
-                    snprintf(winTitle, sizeof(winTitle),
-                        "Imno | Connected: %s [Elapsed: %s]",
-                        g_ProcessConnectTimeStr,
-                        elapsedStr);
-                }
-                else {
-                    snprintf(winTitle, sizeof(winTitle),
-                        "Imno - DBK64 Kernel Suite | %s (%u) - Connected: %s [%s]",
-                        selectedProcName ? selectedProcName : "Process",
-                        g_SelectedPid,
-                        g_ProcessConnectTimeStr,
-                        elapsedStr);
-                }
+                // Full Stealth Kernel Mode window title: never expose "DBK64", "Kernel", "Cheat", or target process name
+                snprintf(winTitle, sizeof(winTitle),
+                    "Imno | Connected: %s [Elapsed: %s]",
+                    g_ProcessConnectTimeStr,
+                    elapsedStr);
                 glfwSetWindowTitle(window, winTitle);
             }
         }
@@ -2188,7 +2126,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             }
             if (s_LastTitlePid != 0) {
                 s_LastTitlePid = 0;
-                glfwSetWindowTitle(window, "Imno - DBK64 Kernel Suite");
+                glfwSetWindowTitle(window, "Imno");
             }
         }
 
@@ -2582,17 +2520,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     }
 
                     ImGui::Separator();
-                    if (ImGui::Button("Open kernel handle", ImVec2(140, 24)) && g_SelectedPid != 0) {
-                        UCHAR special = 0;
-                        DbkOpenProcessHandle(g_SelectedPid, &g_OpenProcessHandle, &special);
-                    }
-                    ImGui::Text("Kernel handle: 0x%llX", g_OpenProcessHandle);
-
-                    ImGui::Separator();
-                    if (ImGui::Button("Get PEPROCESS", ImVec2(140, 24)) && g_SelectedPid != 0) {
+                    if (ImGui::Button("Stealth Attach (PEPROCESS + CR3)", ImVec2(230, 24)) && g_SelectedPid != 0) {
                         DbkGetPEPROCESS(g_SelectedPid, &g_PeProcess);
+                        DbkGetCR3(g_SelectedPid, &g_KernelCR3);
+                        RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
                     }
-                    ImGui::Text("PEPROCESS: 0x%llX", g_PeProcess);
+                    ImGui::Text("PEPROCESS: 0x%llX  |  CR3: 0x%llX", g_PeProcess, g_KernelCR3);
                 }
 
                 ImGui::EndChild();

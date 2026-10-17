@@ -40,14 +40,15 @@
 //  The values below are written by LoadAndStartDriver() and MUST match
 //  the name this GUI opens with ConnectDriver().
 // =====================================================================
-#define DBK_SERVICE_NAME     L"DBK64"
-#define DBK_SERVICE_REG_KEY  L"SYSTEM\\CurrentControlSet\\Services\\DBK64"
-#define DBK_DEVICE_NAME      L"\\Device\\DBK64"            // registry value "A"
-#define DBK_SYMLINK_NAME     L"\\DosDevices\\DBK64"        // registry value "B"
-#define DBK_PROCESS_EVENT    L"\\BaseNamedObjects\\DBKProcList"   // registry value "C"
-#define DBK_THREAD_EVENT     L"\\BaseNamedObjects\\DBKThreadList" // registry value "D"
-#define DBK_DEVICE_PATH      L"\\\\.\\DBK64"               // user-mode open path
-#define DBK_DRIVER_FILE      L"DBK64.sys"
+#define DBK_SERVICE_NAME        L"DBK64"
+#define DBK_SERVICE_REG_KEY     L"SYSTEM\\CurrentControlSet\\Services\\DBK64"
+#define DBK_DEVICE_NAME         L"\\Device\\NullSys64"                  // stealth registry value "A"
+#define DBK_SYMLINK_NAME        L"\\DosDevices\\NullSys64"              // stealth registry value "B"
+#define DBK_PROCESS_EVENT       L"\\BaseNamedObjects\\SysProcSyncEvt"   // stealth registry value "C"
+#define DBK_THREAD_EVENT        L"\\BaseNamedObjects\\SysThrdSyncEvt"   // stealth registry value "D"
+#define DBK_DEVICE_PATH         L"\\\\.\\NullSys64"                     // primary stealth user-mode path
+#define DBK_LEGACY_DEVICE_PATH  L"\\\\.\\DBK64"                         // fallback if legacy instance is running
+#define DBK_DRIVER_FILE         L"DBK64.sys"
 
 #define DBK_VERSION_EXPECTED 2000027
 
@@ -252,7 +253,6 @@ bool DbkFreeNonPaged(ULONG64 addr);
 bool DbkAllocProcessMem(ULONG pid, ULONG64 size, ULONG64* out);
 bool DbkSuspendProcess(ULONG pid);
 bool DbkResumeProcess(ULONG pid);
-bool DbkOpenProcessHandle(ULONG pid, ULONG64* handle, UCHAR* special);
 bool DbkGetPEPROCESS(ULONG pid, ULONG64* out);
 bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
