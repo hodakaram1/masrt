@@ -125,6 +125,8 @@ typedef struct _DBK_STEALTH_FREEZE_ENTRY {
 	UINT64 ProcessId;
 	UINT64 Address;
 	UINT64 Value64;
+	UINT64 ShadowAddress;
+	UINT64 ShadowValue64;
 	ULONG  Size;
 	ULONG  Enabled;
 } DBK_STEALTH_FREEZE_ENTRY, *PDBK_STEALTH_FREEZE_ENTRY;

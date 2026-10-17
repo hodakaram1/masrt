@@ -1377,14 +1377,23 @@ static VOID StealthFreezeKernelThread(IN PVOID StartContext)
 				DWORD pid = (DWORD)localEntries[i].ProcessId;
 				PVOID addr = (PVOID)(UINT_PTR)localEntries[i].Address;
 				DWORD sz = (DWORD)localEntries[i].Size;
+				PEPROCESS proc = NULL;
 
-				// Conditional Read-Before-Write in Ring-0: only write if the target changed the value
-				if (ReadProcessMemory(pid, NULL, addr, sz, &currentVal))
+				// Single Ring-0 attach to check and atomically restore both Real Value + XOR/Checksum Shadow
+				if (NT_SUCCESS(PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc)))
 				{
-					if (RtlCompareMemory(&currentVal, &localEntries[i].Value64, sz) != sz)
+					if (ReadProcessMemory(pid, proc, addr, sz, &currentVal))
 					{
-						WriteProcessMemory(pid, NULL, addr, sz, &localEntries[i].Value64);
+						if (RtlCompareMemory(&currentVal, &localEntries[i].Value64, sz) != sz)
+						{
+							WriteProcessMemory(pid, proc, addr, sz, &localEntries[i].Value64);
+							if (localEntries[i].ShadowAddress != 0)
+							{
+								WriteProcessMemory(pid, proc, (PVOID)(UINT_PTR)localEntries[i].ShadowAddress, sz, &localEntries[i].ShadowValue64);
+							}
+						}
 					}
+					ObDereferenceObject(proc);
 				}
 			}
 		}

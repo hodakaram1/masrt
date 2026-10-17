@@ -136,6 +136,8 @@ typedef struct _DBK_STEALTH_FREEZE_ENTRY {
     ULONG64 ProcessId;
     ULONG64 Address;
     ULONG64 Value64;
+    ULONG64 ShadowAddress;
+    ULONG64 ShadowValue64;
     ULONG   Size;
     ULONG   Enabled;
 } DBK_STEALTH_FREEZE_ENTRY, *PDBK_STEALTH_FREEZE_ENTRY;
@@ -204,17 +206,43 @@ typedef struct _ModuleInfo {
 #pragma pack(pop)
 
 // =====================================================================
-//  Cheat Table Item Structure
+//  Cheat Table Item Structure (with Anti-Disconnect Shadow/XOR Sync)
 // =====================================================================
+enum FreezeModeType : int {
+    FREEZE_MODE_ANTIDC_SMART  = 0, // Auto Shadow/XOR Sync + Post-Write Safe Grace (prevents Conquer.exe DC)
+    FREEZE_MODE_ANTIDC_CLAMP  = 1, // Keep >= Target (only restores when value drops below target)
+    FREEZE_MODE_ANTIDC_SMOOTH = 2, // Gradual Step Restore (prevents big-delta server packet DC)
+    FREEZE_MODE_INSTANT_LOCK  = 3  // Fast Ring-0 lock (8ms..18ms)
+};
+
+enum ShadowRelationType : int {
+    SHADOW_REL_NONE     = 0,
+    SHADOW_REL_MIRROR   = 1, // Shadow == Value
+    SHADOW_REL_XOR      = 2, // Shadow == Value ^ Key  (Conquer.exe anti-tamper XOR shadow)
+    SHADOW_REL_ADD_DIFF = 3, // Shadow == Value + Key  (Additive offset checksum)
+    SHADOW_REL_ADD_SUM  = 4, // Shadow == Key - Value  (Complement sum checksum)
+    SHADOW_REL_BITNOT   = 5  // Shadow == ~Value
+};
+
 struct CheatItem {
     ULONG_PTR Address;
     ULONG64   Value64;
     bool      Enabled;
-    int       DataType;           // size/type captured when the item was added
-    ULONG     Pid;                // process captured when the item was added
+    int       DataType;             // size/type captured when the item was added
+    ULONG     Pid;                  // process captured when the item was added
     char      Description[64];
-    ULONG64   PhysicalAddress = 0; // cached physical RAM address (IOCTL_CE_GETPHYSICALADDRESS)
-    ULONG     WriteHits = 0;       // count of stealth restores when the game changed the value
+    ULONG64   PhysicalAddress = 0;  // cached physical RAM address (IOCTL_CE_GETPHYSICALADDRESS)
+    ULONG     WriteHits = 0;        // count of stealth restores when the game changed the value
+    int       FreezeMode = FREEZE_MODE_ANTIDC_SMART;
+
+    // Anti-Disconnect Struct Shadow / XOR Checksum Discovery & Sync
+    bool      HasBaseline = false;
+    ULONG64   BaselineValue = 0;
+    BYTE      StructBaseline[128] = { 0 }; // [-0x40 .. +0x40] around Address
+    ULONG_PTR ShadowAddress = 0;
+    ULONG64   ShadowKey = 0;
+    int       ShadowRelation = SHADOW_REL_NONE;
+    ULONGLONG LastChangeDetectedTick = 0;
 };
 
 // =====================================================================

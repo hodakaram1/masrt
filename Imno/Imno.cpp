@@ -58,6 +58,8 @@ std::thread g_FreezeThread;
 bool g_StealthFreezeReadBeforeWrite = true;
 bool g_StealthFreezeUsePhysical = true;
 bool g_StealthFreezeIgnoreWP = false;
+int  g_AntiDcGraceMs = 160;
+int  g_AntiDcSmoothStep = 5;
 std::atomic<bool> g_KernelAutonomousFreezeActive(false);
 std::atomic<unsigned> g_CheatTableDirtySeq(1);
 char g_ManualFreezeAddrInput[128] = "";
@@ -1066,6 +1068,148 @@ bool DbkSetWritesIgnoreWP(bool enable)
     return DbkIoctl(IOCTL_CE_WRITESIGNOREWP, &flag, sizeof(flag), NULL, 0, NULL);
 }
 
+static ULONG64 SizeBitMask(ULONG sz)
+{
+    if (sz == 1) return 0xFFULL;
+    if (sz == 2) return 0xFFFFULL;
+    if (sz == 4) return 0xFFFFFFFFULL;
+    return 0xFFFFFFFFFFFFFFFFULL;
+}
+
+static ULONG64 ComputeShadowValue(ULONG64 targetVal, int relation, ULONG64 key, ULONG sz)
+{
+    ULONG64 mask = SizeBitMask(sz);
+    ULONG64 v = targetVal & mask;
+    switch (relation) {
+    case SHADOW_REL_MIRROR:   return v;
+    case SHADOW_REL_XOR:      return (v ^ key) & mask;
+    case SHADOW_REL_ADD_DIFF: return (v + key) & mask;
+    case SHADOW_REL_ADD_SUM:  return (key - v) & mask;
+    case SHADOW_REL_BITNOT:   return (~v) & mask;
+    default:                  return 0;
+    }
+}
+
+static void CaptureShadowBaseline(CheatItem& item)
+{
+    if (g_hDriver == INVALID_HANDLE_VALUE || item.Pid == 0 || item.Address < 0x40)
+        return;
+
+    ULONG sz = GetDataSize(item.DataType);
+    if (sz == 0 || sz > 8) sz = 4;
+    ULONG64 mask = SizeBitMask(sz);
+
+    ULONG64 curVal = 0;
+    if (!DbkReadBytes(item.Pid, item.Address, &curVal, sz))
+        return;
+    curVal &= mask;
+
+    ULONG_PTR baseStart = item.Address - 0x40;
+    if (DbkReadBytes(item.Pid, baseStart, item.StructBaseline, sizeof(item.StructBaseline))) {
+        item.BaselineValue = curVal;
+        item.HasBaseline = true;
+
+        // Check if there is already an immediate Mirror or Bitwise-NOT shadow in [-0x40 .. +0x40]
+        if (item.ShadowRelation == SHADOW_REL_NONE && curVal != 0) {
+            for (int off = -0x40; off <= 0x40 - (int)sz; off += (int)sz) {
+                if (off == 0) continue;
+                ULONG64 s0 = 0;
+                memcpy(&s0, item.StructBaseline + (0x40 + off), sz);
+                s0 &= mask;
+                if (s0 == curVal) {
+                    item.ShadowAddress = (ULONG_PTR)((LONG_PTR)item.Address + off);
+                    item.ShadowRelation = SHADOW_REL_MIRROR;
+                    item.ShadowKey = 0;
+                    break;
+                }
+                else if (s0 == ((~curVal) & mask)) {
+                    item.ShadowAddress = (ULONG_PTR)((LONG_PTR)item.Address + off);
+                    item.ShadowRelation = SHADOW_REL_BITNOT;
+                    item.ShadowKey = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static bool TryDiscoverShadowFromChange(CheatItem& item, ULONG64 newVal, ULONG sz)
+{
+    if (!item.HasBaseline || item.Address < 0x40 || sz == 0 || sz > 8)
+        return false;
+
+    ULONG64 mask = SizeBitMask(sz);
+    ULONG64 v0 = item.BaselineValue & mask;
+    ULONG64 v1 = newVal & mask;
+    if (v0 == v1)
+        return false;
+
+    BYTE curStruct[128] = { 0 };
+    if (!DbkReadBytes(item.Pid, item.Address - 0x40, curStruct, sizeof(curStruct)))
+        return false;
+
+    int bestPriority = 99;
+    int bestOff = 0;
+    int bestRel = SHADOW_REL_NONE;
+    ULONG64 bestKey = 0;
+
+    for (int off = -0x40; off <= 0x40 - (int)sz; off += (int)sz) {
+        if (off == 0) continue;
+        ULONG64 s0 = 0, s1 = 0;
+        memcpy(&s0, item.StructBaseline + (0x40 + off), sz);
+        memcpy(&s1, curStruct + (0x40 + off), sz);
+        s0 &= mask;
+        s1 &= mask;
+
+        if (s0 == s1) continue; // shadow field must have changed when the real value changed
+
+        // 1. XOR Shadow: (S0 ^ V0) == (S1 ^ V1) with non-zero key (Conquer.exe encrypted attribute shadow)
+        if (((s0 ^ v0) & mask) == ((s1 ^ v1) & mask) && ((s0 ^ v0) & mask) != 0) {
+            if (1 < bestPriority) {
+                bestPriority = 1;
+                bestOff = off;
+                bestRel = SHADOW_REL_XOR;
+                bestKey = (s0 ^ v0) & mask;
+            }
+        }
+        // 2. Direct Mirror: S0 == V0 && S1 == V1
+        else if (s0 == v0 && s1 == v1) {
+            if (2 < bestPriority) {
+                bestPriority = 2;
+                bestOff = off;
+                bestRel = SHADOW_REL_MIRROR;
+                bestKey = 0;
+            }
+        }
+        // 3. Additive Delta Checksum: (S0 - V0) == (S1 - V1)
+        else if (((s0 - v0) & mask) == ((s1 - v1) & mask)) {
+            if (3 < bestPriority) {
+                bestPriority = 3;
+                bestOff = off;
+                bestRel = SHADOW_REL_ADD_DIFF;
+                bestKey = (s0 - v0) & mask;
+            }
+        }
+        // 4. Complement Sum Checksum: (S0 + V0) == (S1 + V1)
+        else if (((s0 + v0) & mask) == ((s1 + v1) & mask)) {
+            if (4 < bestPriority) {
+                bestPriority = 4;
+                bestOff = off;
+                bestRel = SHADOW_REL_ADD_SUM;
+                bestKey = (s0 + v0) & mask;
+            }
+        }
+    }
+
+    if (bestRel != SHADOW_REL_NONE) {
+        item.ShadowAddress  = (ULONG_PTR)((LONG_PTR)item.Address + bestOff);
+        item.ShadowRelation = bestRel;
+        item.ShadowKey      = bestKey;
+        return true;
+    }
+    return false;
+}
+
 bool DbkSyncStealthFreeze()
 {
     if (g_hDriver == INVALID_HANDLE_VALUE) {
@@ -1087,17 +1231,28 @@ bool DbkSyncStealthFreeze()
         for (const auto& item : g_CheatTable) {
             if (!item.Enabled || item.Pid == 0 || item.Address == 0)
                 continue;
+            // Only delegate Instant Lock items to the autonomous Ring-0 loop;
+            // Anti-DC Smart/Clamp/Smooth items use the grace/step/shadow controller.
+            if (item.FreezeMode != FREEZE_MODE_INSTANT_LOCK)
+                continue;
             if (conquerPending && item.Pid == conquerPid)
                 continue; // keep 0.5s passive window completely untouched
             if (list.Count >= DBK_MAX_STEALTH_FREEZE_ENTRIES)
                 break;
 
+            ULONG sz = GetDataSize(item.DataType);
+            if (sz == 0 || sz > 8) sz = 4;
+
             DBK_STEALTH_FREEZE_ENTRY& e = list.Entries[list.Count++];
-            e.ProcessId = item.Pid;
-            e.Address   = item.Address;
-            e.Value64   = item.Value64;
-            e.Size      = GetDataSize(item.DataType);
-            e.Enabled   = 1;
+            e.ProcessId     = item.Pid;
+            e.Address       = item.Address;
+            e.Value64       = item.Value64;
+            e.ShadowAddress = item.ShadowAddress;
+            e.ShadowValue64 = (item.ShadowAddress != 0 && item.ShadowRelation != SHADOW_REL_NONE)
+                ? ComputeShadowValue(item.Value64, item.ShadowRelation, item.ShadowKey, sz)
+                : 0;
+            e.Size          = sz;
+            e.Enabled       = 1;
         }
     }
 
@@ -1221,6 +1376,8 @@ void FreezeLoop()
             }
 
             std::lock_guard<std::mutex> lock(g_CheatTableLock);
+            ULONGLONG nowTick = GetTickCount64();
+
             for (auto& item : g_CheatTable) {
                 if (!item.Enabled || item.Pid == 0 || item.Address == 0)
                     continue;
@@ -1231,6 +1388,11 @@ void FreezeLoop()
 
                 ULONG sz = GetDataSize(item.DataType);
                 if (sz == 0 || sz > 8) sz = 4;
+                ULONG64 mask = SizeBitMask(sz);
+
+                if (!item.HasBaseline) {
+                    CaptureShadowBaseline(item);
+                }
 
                 // Resolve and cache Physical RAM Address (PA) in Ring-0 if not cached yet
                 if (item.PhysicalAddress == 0) {
@@ -1239,31 +1401,98 @@ void FreezeLoop()
 
                 bool usePhys = g_StealthFreezeUsePhysical && CanUsePhysicalDirectSafe(item.PhysicalAddress, sz);
 
-                if (g_StealthFreezeReadBeforeWrite) {
-                    ULONG64 curVal = 0;
-                    bool readOk = false;
-                    if (usePhys) {
-                        readOk = DbkReadPhysical(item.PhysicalAddress, &curVal, sz);
-                    }
-                    if (!readOk) {
-                        readOk = DbkReadBytes(item.Pid, item.Address, &curVal, sz);
-                    }
+                ULONG64 curVal = 0;
+                bool readOk = false;
+                if (usePhys) {
+                    readOk = DbkReadPhysical(item.PhysicalAddress, &curVal, sz);
+                }
+                if (!readOk) {
+                    readOk = DbkReadBytes(item.Pid, item.Address, &curVal, sz);
+                }
+                if (!readOk)
+                    continue;
 
-                    // Only write if the target process actually changed the value!
-                    if (readOk && memcmp(&curVal, &item.Value64, sz) == 0) {
+                curVal &= mask;
+                ULONG64 targetVal = item.Value64 & mask;
+
+                // Discover XOR / Checksum / Mirror shadow in the C++ object as soon as the game changes the value
+                if (item.HasBaseline && curVal != (item.BaselineValue & mask) && item.ShadowRelation == SHADOW_REL_NONE) {
+                    if (TryDiscoverShadowFromChange(item, curVal, sz)) {
+                        g_CheatTableDirtySeq++;
+                    }
+                }
+
+                // Mode-specific Anti-Disconnect checks
+                if (item.FreezeMode == FREEZE_MODE_ANTIDC_CLAMP) {
+                    // Only restore when current value drops BELOW target
+                    bool isBelow = false;
+                    if (item.DataType == 1) { // Float
+                        float cf = 0.0f, tf = 0.0f;
+                        memcpy(&cf, &curVal, sizeof(float));
+                        memcpy(&tf, &targetVal, sizeof(float));
+                        isBelow = (cf < tf);
+                    }
+                    else if (item.DataType == 5) { // Double
+                        double cd = 0.0, td = 0.0;
+                        memcpy(&cd, &curVal, sizeof(double));
+                        memcpy(&td, &targetVal, sizeof(double));
+                        isBelow = (cd < td);
+                    }
+                    else {
+                        isBelow = (curVal < targetVal);
+                    }
+                    if (!isBelow) {
+                        item.LastChangeDetectedTick = 0;
+                        continue;
+                    }
+                }
+                else if (g_StealthFreezeReadBeforeWrite && curVal == targetVal) {
+                    item.LastChangeDetectedTick = 0;
+                    continue;
+                }
+
+                // In Anti-DC Smart / Clamp / Smooth modes, wait the post-write grace window (e.g. 160ms)
+                // so Conquer.exe's own setter & packet check finishes without seeing a mid-function conflict.
+                if (item.FreezeMode != FREEZE_MODE_INSTANT_LOCK && g_AntiDcGraceMs > 0) {
+                    if (item.LastChangeDetectedTick == 0) {
+                        item.LastChangeDetectedTick = nowTick;
+                        continue;
+                    }
+                    if ((nowTick - item.LastChangeDetectedTick) < (ULONGLONG)g_AntiDcGraceMs) {
                         continue;
                     }
                 }
 
+                ULONG64 writeVal = targetVal;
+                if (item.FreezeMode == FREEZE_MODE_ANTIDC_SMOOTH && g_AntiDcSmoothStep > 0 &&
+                    item.DataType != 1 && item.DataType != 5) {
+                    ULONG64 step = (ULONG64)g_AntiDcSmoothStep;
+                    if (curVal < targetVal)
+                        writeVal = ((targetVal - curVal) > step) ? (curVal + step) : targetVal;
+                    else if (curVal > targetVal)
+                        writeVal = ((curVal - targetVal) > step) ? (curVal - step) : targetVal;
+                }
+
+                // 1) Update paired XOR / Checksum / Mirror Shadow FIRST so integrity checks never see a mismatch
+                if (item.ShadowAddress != 0 && item.ShadowRelation != SHADOW_REL_NONE) {
+                    ULONG64 shadowVal = ComputeShadowValue(writeVal, item.ShadowRelation, item.ShadowKey, sz);
+                    DbkWriteBytes(item.Pid, item.ShadowAddress, &shadowVal, sz);
+                }
+
+                // 2) Update Real Value via Physical RAM or Ring-0
                 bool wroteOk = false;
                 if (usePhys) {
-                    wroteOk = DbkWritePhysical(item.PhysicalAddress, &item.Value64, sz);
+                    wroteOk = DbkWritePhysical(item.PhysicalAddress, &writeVal, sz);
                 }
                 if (!wroteOk) {
-                    wroteOk = DbkWriteBytes(item.Pid, item.Address, &item.Value64, sz);
+                    wroteOk = DbkWriteBytes(item.Pid, item.Address, &writeVal, sz);
                 }
                 if (wroteOk) {
                     item.WriteHits++;
+                    if (writeVal == targetVal)
+                        item.LastChangeDetectedTick = 0;
+                    else
+                        item.LastChangeDetectedTick = nowTick;
                 }
             }
         }
@@ -1712,8 +1941,16 @@ void ConquerWatchLoop()
                 for (auto& item : g_CheatTable) {
                     if (item.Pid == trackedPid || item.Pid == g_SelectedPid ||
                         (lastKnownConquerPid != 0 && item.Pid == lastKnownConquerPid)) {
-                        item.Pid = reattachPid;
-                        item.PhysicalAddress = 0; // re-resolve physical address for the new process instance
+                        if (item.Pid != reattachPid) {
+                            item.Pid = reattachPid;
+                            item.PhysicalAddress = 0;
+                            item.HasBaseline = false;
+                            item.ShadowAddress = 0;
+                            item.ShadowKey = 0;
+                            item.ShadowRelation = SHADOW_REL_NONE;
+                            item.LastChangeDetectedTick = 0;
+                        }
+                        CaptureShadowBaseline(item);
                     }
                 }
             }
@@ -2365,6 +2602,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 }
 
                 ImGui::Text("Scan Results Found: %zu", s_DisplayAddrs.size());
+                if (!g_IsScanning && !s_DisplayAddrs.empty() && s_DisplayAddrs.size() <= 32) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Freeze All Found Together (Anti-DC Sync)", ImVec2(280, 24))) {
+                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        for (size_t idx = 0; idx < s_DisplayAddrs.size(); ++idx) {
+                            ULONG64 pa = 0;
+                            DbkGetPhysicalAddress(g_SelectedPid, s_DisplayAddrs[idx], &pa);
+                            std::string autoDesc = GetAutoOffsetForAddress(s_DisplayAddrs[idx]);
+                            CheatItem newItem = { s_DisplayAddrs[idx], s_DisplayVals[idx], true, g_ResultsDataType, g_SelectedPid, "", pa, 0, FREEZE_MODE_ANTIDC_SMART };
+                            strcpy_s(newItem.Description, sizeof(newItem.Description), autoDesc.c_str());
+                            CaptureShadowBaseline(newItem);
+                            if (newItem.ShadowAddress == 0 && s_DisplayAddrs.size() >= 2) {
+                                size_t siblingIdx = (idx + 1) % s_DisplayAddrs.size();
+                                newItem.ShadowAddress = s_DisplayAddrs[siblingIdx];
+                                newItem.ShadowRelation = SHADOW_REL_MIRROR;
+                            }
+                            g_CheatTable.push_back(newItem);
+                        }
+                        g_CheatTableDirtySeq++;
+                    }
+                }
                 if (!g_IsScanning && g_ScanTruncated) {
                     ImGui::TextColored({ 1.0f, 0.6f, 0.0f, 1.0f },
                         "Results truncated at %d - use Next Scan or a narrower range!", MAX_SCAN_RESULTS);
@@ -2394,8 +2652,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                                 DbkGetPhysicalAddress(g_SelectedPid, s_DisplayAddrs[i], &pa);
                                 std::lock_guard<std::mutex> lock(g_CheatTableLock);
                                 std::string autoDesc = GetAutoOffsetForAddress(s_DisplayAddrs[i]);
-                                CheatItem newItem = { s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, "", pa, 0 };
+                                CheatItem newItem = { s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, "", pa, 0, FREEZE_MODE_ANTIDC_SMART };
                                 strcpy_s(newItem.Description, sizeof(newItem.Description), autoDesc.c_str());
+                                CaptureShadowBaseline(newItem);
+                                // If the scan narrowed down to 2..8 sibling addresses with the same value, link the sibling mirror automatically
+                                if (newItem.ShadowAddress == 0 && s_DisplayAddrs.size() >= 2 && s_DisplayAddrs.size() <= 8) {
+                                    for (size_t sib = 0; sib < s_DisplayAddrs.size(); ++sib) {
+                                        if (sib != (size_t)i && s_DisplayVals[sib] == s_DisplayVals[i]) {
+                                            newItem.ShadowAddress = s_DisplayAddrs[sib];
+                                            newItem.ShadowRelation = SHADOW_REL_MIRROR;
+                                            break;
+                                        }
+                                    }
+                                }
                                 g_CheatTable.push_back(newItem);
                                 g_CheatTableDirtySeq++;
                             }
@@ -2411,24 +2680,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::EndTabItem();
             }
 
-            // TAB 2: CHEAT TABLE (STEALTH KERNEL FREEZE)
+            // TAB 2: CHEAT TABLE (STEALTH KERNEL FREEZE + ANTI-DISCONNECT)
             if (ImGui::BeginTabItem("Cheat Table"))
             {
-                ImGui::TextColored({ 0.2f, 1.0f, 0.5f, 1.0f }, "[Stealth Kernel Freeze Engine]");
+                ImGui::TextColored({ 0.2f, 1.0f, 0.5f, 1.0f }, "[Stealth Kernel Freeze + Anti-Disconnect Engine]");
                 ImGui::SameLine();
-                if (g_KernelAutonomousFreezeActive.load()) {
-                    ImGui::TextColored({ 0.3f, 0.9f, 1.0f, 1.0f }, "(Ring-0 Autonomous Thread + Conditional Physical/Kernel Freeze)");
-                }
-                else {
-                    ImGui::TextDisabled("(Conditional Read-Before-Write + Physical RAM / Ring-0 + Micro-Jitter)");
-                }
+                ImGui::TextDisabled("(Auto XOR/Shadow Sync + Post-Setter Grace + Read-Before-Write)");
 
-                ImGui::Checkbox("Read-Before-Write (Stealth: write only on change)", &g_StealthFreezeReadBeforeWrite);
+                ImGui::Checkbox("Read-Before-Write (Stealth)", &g_StealthFreezeReadBeforeWrite);
                 ImGui::SameLine();
                 ImGui::Checkbox("Physical RAM Direct (PA)", &g_StealthFreezeUsePhysical);
                 ImGui::SameLine();
                 if (ImGui::Checkbox("CR0.WP Ring-0 Bypass", &g_StealthFreezeIgnoreWP)) {
                     DbkSetWritesIgnoreWP(g_StealthFreezeIgnoreWP);
+                }
+
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderInt("Anti-DC Grace (ms)", &g_AntiDcGraceMs, 0, 500);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110);
+                if (ImGui::InputInt("Smooth Step", &g_AntiDcSmoothStep)) {
+                    if (g_AntiDcSmoothStep < 1) g_AntiDcSmoothStep = 1;
                 }
 
                 ImGui::Separator();
@@ -2450,8 +2722,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                         ULONG64 pa = 0;
                         DbkGetPhysicalAddress(g_SelectedPid, addr, &pa);
                         std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                        CheatItem item = { addr, val64, true, g_SelectedDataType, g_SelectedPid, "", pa, 0 };
+                        CheatItem item = { addr, val64, true, g_SelectedDataType, g_SelectedPid, "", pa, 0, FREEZE_MODE_ANTIDC_SMART };
                         strcpy_s(item.Description, sizeof(item.Description), g_ManualFreezeDescInput);
+                        CaptureShadowBaseline(item);
                         g_CheatTable.push_back(item);
                         g_CheatTableDirtySeq++;
                     }
@@ -2459,6 +2732,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                 ImGui::BeginChild("CheatTableChild", ImVec2(0, 320), true);
                 {
+                    static const char* kFreezeModeLabels[] = {
+                        "Anti-DC Smart (XOR+Grace)",
+                        "Anti-DC Min (>= Target)",
+                        "Anti-DC Smooth Step",
+                        "Instant Lock (Fast)"
+                    };
+
                     std::lock_guard<std::mutex> lock(g_CheatTableLock);
                     for (int i = 0; i < (int)g_CheatTable.size(); i++) {
                         ImGui::PushID(i);
@@ -2466,43 +2746,53 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                         bool isEnabled = g_CheatTable[i].Enabled;
                         if (ImGui::Checkbox("##en", &isEnabled)) {
                             g_CheatTable[i].Enabled = isEnabled;
-                            if (isEnabled && g_CheatTable[i].PhysicalAddress == 0) {
-                                DbkGetPhysicalAddress(g_CheatTable[i].Pid, g_CheatTable[i].Address, &g_CheatTable[i].PhysicalAddress);
+                            if (isEnabled) {
+                                if (g_CheatTable[i].PhysicalAddress == 0)
+                                    DbkGetPhysicalAddress(g_CheatTable[i].Pid, g_CheatTable[i].Address, &g_CheatTable[i].PhysicalAddress);
+                                CaptureShadowBaseline(g_CheatTable[i]);
                             }
                             g_CheatTableDirtySeq++;
                         }
                         ImGui::SameLine();
 
-                        if (g_CheatTable[i].PhysicalAddress != 0) {
-                            ImGui::Text("VA: 0x%llX [PA: 0x%llX | PID %u]",
-                                (unsigned long long)g_CheatTable[i].Address,
-                                (unsigned long long)g_CheatTable[i].PhysicalAddress,
-                                g_CheatTable[i].Pid);
+                        ImGui::Text("0x%llX", (unsigned long long)g_CheatTable[i].Address);
+                        ImGui::SameLine();
+                        if (g_CheatTable[i].ShadowRelation == SHADOW_REL_XOR) {
+                            ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "[XOR Sync @0x%llX]", (unsigned long long)g_CheatTable[i].ShadowAddress);
+                        }
+                        else if (g_CheatTable[i].ShadowRelation == SHADOW_REL_MIRROR) {
+                            ImGui::TextColored({ 0.3f, 0.9f, 1.0f, 1.0f }, "[Mirror @0x%llX]", (unsigned long long)g_CheatTable[i].ShadowAddress);
+                        }
+                        else if (g_CheatTable[i].ShadowRelation != SHADOW_REL_NONE) {
+                            ImGui::TextColored({ 1.0f, 0.85f, 0.2f, 1.0f }, "[CRC Sync @0x%llX]", (unsigned long long)g_CheatTable[i].ShadowAddress);
                         }
                         else {
-                            ImGui::Text("VA: 0x%llX [Ring-0 | PID %u]",
-                                (unsigned long long)g_CheatTable[i].Address,
-                                g_CheatTable[i].Pid);
+                            ImGui::TextDisabled("[PA:0x%llX]", (unsigned long long)g_CheatTable[i].PhysicalAddress);
                         }
-                        ImGui::SameLine(340);
 
+                        ImGui::SameLine(270);
                         char valStr[64];
                         FormatValueToString(g_CheatTable[i].Value64, g_CheatTable[i].DataType, valStr, sizeof(valStr));
-
-                        ImGui::SetNextItemWidth(130);
+                        ImGui::SetNextItemWidth(110);
                         if (ImGui::InputText("##val", valStr, sizeof(valStr))) {
                             g_CheatTable[i].Value64 = ParseInputToValue(valStr, g_CheatTable[i].DataType);
                             g_CheatTableDirtySeq++;
                         }
 
-                        ImGui::SameLine(480);
-                        ImGui::SetNextItemWidth(160);
+                        ImGui::SameLine(390);
+                        ImGui::SetNextItemWidth(185);
+                        if (ImGui::Combo("##fmode", &g_CheatTable[i].FreezeMode, kFreezeModeLabels, IM_ARRAYSIZE(kFreezeModeLabels))) {
+                            g_CheatTableDirtySeq++;
+                        }
+
+                        ImGui::SameLine(585);
+                        ImGui::SetNextItemWidth(140);
                         ImGui::InputText("##desc", g_CheatTable[i].Description, sizeof(g_CheatTable[i].Description));
 
-                        ImGui::SameLine(650);
-                        ImGui::TextColored({ 0.4f, 0.9f, 1.0f, 1.0f }, "Restored: %u", g_CheatTable[i].WriteHits);
+                        ImGui::SameLine(735);
+                        ImGui::TextColored({ 0.4f, 0.9f, 1.0f, 1.0f }, "Hits:%u", g_CheatTable[i].WriteHits);
 
-                        ImGui::SameLine(760);
+                        ImGui::SameLine(810);
                         if (ImGui::Button("Remove")) {
                             g_CheatTable.erase(g_CheatTable.begin() + i--);
                             g_CheatTableDirtySeq++;
@@ -2606,8 +2896,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                         ULONG64 pa = 0;
                         DbkGetPhysicalAddress(g_SelectedPid, g_ResolvedAddress, &pa);
                         std::lock_guard<std::mutex> lock(g_CheatTableLock);
-                        CheatItem item = { g_ResolvedAddress, g_ResolvedValue, true, g_SelectedDataType, g_SelectedPid, "", pa, 0 };
+                        CheatItem item = { g_ResolvedAddress, g_ResolvedValue, true, g_SelectedDataType, g_SelectedPid, "", pa, 0, FREEZE_MODE_ANTIDC_SMART };
                         strcpy_s(item.Description, sizeof(item.Description), "Resolved Pointer Freeze");
+                        CaptureShadowBaseline(item);
                         g_CheatTable.push_back(item);
                         g_CheatTableDirtySeq++;
                     }
