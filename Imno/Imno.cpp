@@ -1,5 +1,4 @@
 #include "Imno.h"
-#include "CEServer.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +28,8 @@ bool   g_DriverConnected = false;
 std::vector<ProcessInfo> g_ProcessList;
 std::vector<ModuleInfo>  g_LoadedModules;
 ULONG g_SelectedPid = 0;
+ULONGLONG g_ProcessConnectTick = 0;
+char  g_ProcessConnectTimeStr[32] = "";
 char  g_ProcessFilter[64] = "";
 char  g_ModuleFilter[64] = "";
 
@@ -55,6 +56,21 @@ std::mutex g_CheatTableLock;
 std::atomic<bool> g_FreezeRunning(true);
 std::thread g_FreezeThread;
 
+// Auto-Reconnect Conquer.exe (with automatic 0.5s / 500ms re-attach)
+#define CONQUER_REATTACH_DELAY_MS 500ULL
+bool                  g_AutoConnectConquer = true;
+std::atomic<bool>     g_ConquerWatchRunning(true);
+std::thread           g_ConquerWatchThread;
+std::mutex            g_ConquerWatchLock;
+ULONG                 g_ConquerTrackedPid = 0;
+ULONGLONG             g_ConquerConnectTick = 0;
+char                  g_ConquerConnectTimeStr[32] = "";
+bool                  g_ConquerReattachPending = false;
+ULONGLONG             g_ConquerReattachTargetTick = 0;
+bool                  g_ConquerReattachedAfterDelay = false;
+std::atomic<unsigned> g_ConquerEventSeq(0);
+std::atomic<unsigned> g_ConquerReconnectCount(0);
+
 // Pointer Resolver & Assembler Patching
 char g_PointerBaseInput[128] = "";
 char g_PointerOffsetInput[128] = "0";
@@ -64,9 +80,6 @@ ResolvedPointer g_LastResolved = {};
 
 char g_PatchAddressInput[128] = "";
 char g_PatchPatternInput[128] = "0x90, 0x90";
-
-// CoServer (CEServer bridge) tab state
-char      g_CoServerPort[16] = "52736";
 
 // Kernel tab state
 ULONG     g_KernelVersion = 0;
@@ -615,7 +628,44 @@ bool IsTarget64Bit(ULONG pid)
 {
     if (pid == 0) return true;
 
-    // 1) Accurate: ask the OS via a limited-information handle.
+    // If this is the currently attached process and we already resolved its bitness,
+    // return the cached bitness without opening any user-mode handle.
+    if (pid == g_SelectedPid && g_ConquerTrackedPid == pid)
+        return g_SelectedIs64;
+
+    // 1) Stealth Kernel Check (zero handles opened): inspect PE header at 0x400000 (standard 32-bit EXE base)
+    //    or loaded modules via kernel memory reads if the DBK64 driver is connected.
+    if (g_hDriver != INVALID_HANDLE_VALUE) {
+        BYTE hdr[512] = { 0 };
+        if (DbkReadBytes(pid, 0x400000, hdr, sizeof(hdr)) && hdr[0] == 'M' && hdr[1] == 'Z') {
+            LONG lfanew = *(LONG*)(hdr + 0x3C);
+            if (lfanew >= 0x40 && lfanew <= (LONG)(sizeof(hdr) - 32) &&
+                *(DWORD*)(hdr + lfanew) == IMAGE_NT_SIGNATURE) {
+                WORD magic = *(WORD*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+                if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+                if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) return true;
+            }
+        }
+        if (pid == g_SelectedPid) {
+            for (const auto& m : g_LoadedModules) {
+                if (DbkReadBytes(pid, m.BaseAddress, hdr, sizeof(hdr)) && hdr[0] == 'M' && hdr[1] == 'Z') {
+                    LONG lfanew = *(LONG*)(hdr + 0x3C);
+                    if (lfanew >= 0x40 && lfanew <= (LONG)(sizeof(hdr) - 32) &&
+                        *(DWORD*)(hdr + lfanew) == IMAGE_NT_SIGNATURE) {
+                        WORD magic = *(WORD*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+                        if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+                        if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Never open a user-mode handle or module snapshot on Conquer.exe
+    if (pid == g_ConquerTrackedPid)
+        return false;
+
+    // 2) User-mode fallback when driver is not loaded
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (h) {
         BOOL wow64 = FALSE;
@@ -624,8 +674,6 @@ bool IsTarget64Bit(ULONG pid)
         if (ok) return !wow64; // not WOW64 => native 64-bit
     }
 
-    // 2) Fallback: a WOW64 process exposes 32-bit modules; a native one has none.
-    //    Toolhelp snapshots work without opening the target process.
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, pid);
     if (snap != INVALID_HANDLE_VALUE) {
         MODULEENTRY32W me;
@@ -635,7 +683,6 @@ bool IsTarget64Bit(ULONG pid)
         if (has32) return false;
     }
 
-    // 3) Default (e.g. protected system processes that can't be opened): native.
     return true;
 }
 
@@ -755,11 +802,22 @@ std::string GetZydisDisassembledBytes(ULONG_PTR targetAddr, ULONG instructionCou
     if (instructionCount == 0) instructionCount = 1;
 
     UCHAR codeBuffer[64] = { 0 };
-    for (ULONG offset = 0; offset < 64; offset += 8) {
-        ULONG64 val = 0;
-        DbkReadBytes(g_SelectedPid, targetAddr + offset, &val, 8);
-        memcpy(codeBuffer + offset, &val, 8);
+    SIZE_T readableLen = 0;
+    if (DbkReadBytes(g_SelectedPid, targetAddr, codeBuffer, sizeof(codeBuffer))) {
+        readableLen = sizeof(codeBuffer);
     }
+    else {
+        for (ULONG offset = 0; offset < sizeof(codeBuffer); offset += 8) {
+            ULONG64 val = 0;
+            if (!DbkReadBytes(g_SelectedPid, targetAddr + offset, &val, 8))
+                break;
+            memcpy(codeBuffer + offset, &val, 8);
+            readableLen += 8;
+        }
+    }
+
+    if (readableLen == 0)
+        return "0x90, 0x90";
 
     // 64-bit targets decode as long-mode 64-bit; 32-bit (WOW64) targets as
     // long-mode compatibility 32-bit, otherwise instructions are mis-decoded.
@@ -776,8 +834,8 @@ std::string GetZydisDisassembledBytes(ULONG_PTR targetAddr, ULONG instructionCou
     bool firstByte = true;
 
     SIZE_T offset = 0;
-    for (ULONG decoded = 0; decoded < instructionCount && offset < sizeof(codeBuffer); decoded++) {
-        if (ZydisDecoderDecodeFull(&decoder, codeBuffer + offset, sizeof(codeBuffer) - offset, &instruction, operands) != ZYAN_STATUS_SUCCESS)
+    for (ULONG decoded = 0; decoded < instructionCount && offset < readableLen; decoded++) {
+        if (ZydisDecoderDecodeFull(&decoder, codeBuffer + offset, readableLen - offset, &instruction, operands) != ZYAN_STATUS_SUCCESS)
             break;
 
         for (ZyanUSize b = 0; b < instruction.length; b++) {
@@ -1083,11 +1141,25 @@ void RefreshProcessList()
 
 void RefreshModules()
 {
-    g_LoadedModules.clear();
-    if (g_SelectedPid == 0) return;
+    if (g_SelectedPid == 0) {
+        g_LoadedModules.clear();
+        return;
+    }
 
+    // When connected to Conquer.exe (or when stealth kernel mode is active and driver is loaded),
+    // enumerate modules purely through kernel memory without opening any user-mode handle.
+    if (g_hDriver != INVALID_HANDLE_VALUE && g_ConquerTrackedPid == g_SelectedPid) {
+        RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
+        return;
+    }
+
+    g_LoadedModules.clear();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_SelectedPid);
-    if (snap == INVALID_HANDLE_VALUE) return;
+    if (snap == INVALID_HANDLE_VALUE) {
+        if (g_hDriver != INVALID_HANDLE_VALUE)
+            RefreshModulesStealth(g_SelectedPid, &g_SelectedIs64);
+        return;
+    }
 
     MODULEENTRY32W me;
     me.dwSize = sizeof(me);
@@ -1103,6 +1175,433 @@ void RefreshModules()
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
+}
+
+// Parse a PE image header at `baseAddr` purely via DBK64 kernel memory reads (zero handles opened).
+static bool TryReadPeModuleStealth(ULONG pid, ULONG_PTR baseAddr, ModuleInfo* outMod, bool* outIs64, bool* outIsExe)
+{
+    if (!baseAddr || (baseAddr & 0xFFFF) != 0)
+        return false;
+
+    BYTE hdr[1024] = { 0 };
+    if (!DbkReadBytes(pid, baseAddr, hdr, sizeof(hdr)))
+        return false;
+
+    if (hdr[0] != 'M' || hdr[1] != 'Z')
+        return false;
+
+    LONG lfanew = *(LONG*)(hdr + 0x3C);
+    if (lfanew < 0x40 || lfanew > (LONG)(sizeof(hdr) - sizeof(IMAGE_NT_HEADERS64)))
+        return false;
+
+    if (*(DWORD*)(hdr + lfanew) != IMAGE_NT_SIGNATURE)
+        return false;
+
+    IMAGE_FILE_HEADER* fh = (IMAGE_FILE_HEADER*)(hdr + lfanew + 4);
+    WORD magic = *(WORD*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+
+    ULONG sizeOfImage = 0;
+    ULONG sectionAlignment = 0;
+    ULONG exportRva = 0;
+    ULONG exportSize = 0;
+    bool is64 = true;
+
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        IMAGE_OPTIONAL_HEADER32* opt32 = (IMAGE_OPTIONAL_HEADER32*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+        sizeOfImage = opt32->SizeOfImage;
+        sectionAlignment = opt32->SectionAlignment;
+        if (opt32->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportRva = opt32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportSize = opt32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+        is64 = false;
+    }
+    else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        IMAGE_OPTIONAL_HEADER64* opt64 = (IMAGE_OPTIONAL_HEADER64*)(hdr + lfanew + 4 + sizeof(IMAGE_FILE_HEADER));
+        sizeOfImage = opt64->SizeOfImage;
+        sectionAlignment = opt64->SectionAlignment;
+        if (opt64->NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportRva = opt64->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportSize = opt64->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+        is64 = true;
+    }
+    else {
+        return false;
+    }
+
+    if (sizeOfImage < 0x1000 || sizeOfImage > 0x40000000 ||
+        sectionAlignment < 0x1000 || (sectionAlignment & (sectionAlignment - 1)) != 0)
+        return false;
+
+    bool isDll = (fh->Characteristics & IMAGE_FILE_DLL) != 0;
+    if (outIs64) *outIs64 = is64;
+    if (outIsExe) *outIsExe = !isDll;
+
+    if (outMod) {
+        memset(outMod, 0, sizeof(ModuleInfo));
+        outMod->BaseAddress = baseAddr;
+        outMod->Size = sizeOfImage;
+
+        if (exportRva != 0 && exportRva + sizeof(IMAGE_EXPORT_DIRECTORY) <= sizeOfImage && exportSize >= sizeof(IMAGE_EXPORT_DIRECTORY)) {
+            IMAGE_EXPORT_DIRECTORY expDir = {};
+            if (DbkReadBytes(pid, baseAddr + exportRva, &expDir, sizeof(expDir)) &&
+                expDir.Name != 0 && expDir.Name < sizeOfImage) {
+                char modName[128] = { 0 };
+                if (DbkReadBytes(pid, baseAddr + expDir.Name, modName, sizeof(modName) - 1)) {
+                    modName[sizeof(modName) - 1] = '\0';
+                    bool validAscii = (modName[0] >= 0x21 && modName[0] < 0x7F);
+                    for (size_t i = 0; i < sizeof(modName) && modName[i] != '\0'; ++i) {
+                        if ((unsigned char)modName[i] < 0x20 || (unsigned char)modName[i] >= 0x7F) {
+                            validAscii = false;
+                            break;
+                        }
+                    }
+                    if (validAscii) {
+                        strcpy_s(outMod->ModuleName, sizeof(outMod->ModuleName), modName);
+                    }
+                }
+            }
+        }
+
+        if (outMod->ModuleName[0] == '\0') {
+            if (!isDll) {
+                const char* procName = NULL;
+                for (const auto& p : g_ProcessList) {
+                    if (p.ProcessId == pid) { procName = p.Name; break; }
+                }
+                if (procName && procName[0] != '\0')
+                    strcpy_s(outMod->ModuleName, sizeof(outMod->ModuleName), procName);
+                else
+                    strcpy_s(outMod->ModuleName, sizeof(outMod->ModuleName), "Conquer.exe");
+            }
+            else {
+                snprintf(outMod->ModuleName, sizeof(outMod->ModuleName), "Module_0x%llX.dll", (unsigned long long)baseAddr);
+            }
+        }
+        snprintf(outMod->FullPath, sizeof(outMod->FullPath), "[Stealth Kernel PE @ 0x%llX]", (unsigned long long)baseAddr);
+    }
+
+    return true;
+}
+
+// Stealth module enumeration: walks virtual memory in Ring-0 (DbkQueryVirtualMemory + DbkReadBytes)
+// without calling OpenProcess or CreateToolhelp32Snapshot(TH32CS_SNAPMODULE).
+void RefreshModulesStealth(ULONG pid, bool* outIs64)
+{
+    g_LoadedModules.clear();
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0)
+        return;
+
+    bool detected32Bit = false;
+    bool foundMainExe = false;
+    ULONG mainExeSize = 0;
+
+    // 1) Check standard 32-bit image base (0x400000, used by Conquer.exe) directly first
+    {
+        ModuleInfo mod = {};
+        bool modIs64 = true;
+        bool isExe = false;
+        if (TryReadPeModuleStealth(pid, 0x400000, &mod, &modIs64, &isExe)) {
+            g_LoadedModules.push_back(mod);
+            if (!modIs64) detected32Bit = true;
+            if (isExe) foundMainExe = true;
+            mainExeSize = mod.Size;
+        }
+    }
+
+    // 2) Walk readable regions via Ring-0 page tables and probe 64 KB allocation boundaries
+    //    to find all loaded PE images (even if adjacent read-only regions are merged by the page walker).
+    ULONG_PTR cursor = 0x10000;
+    ULONG_PTR maxAddr = (foundMainExe && detected32Bit) ? 0xFFFE0000ULL : 0x7FFFFFFF0000ULL;
+    ULONG guard = 0;
+
+    while (cursor < maxAddr && ++guard < 65536 && g_LoadedModules.size() < 256) {
+        ULONG_PTR length = 0;
+        ULONG protection = 0;
+        if (!DbkQueryVirtualMemory(pid, cursor, &length, &protection) || length == 0)
+            break;
+
+        ULONG_PTR base = cursor & ~(ULONG_PTR)0xFFF;
+        ULONG_PTR end = base + length;
+        if (end <= base)
+            break;
+
+        if (protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE) {
+            ULONG_PTR probe = (base + 0xFFFFULL) & ~(ULONG_PTR)0xFFFFULL;
+            while (probe < end && probe < maxAddr && g_LoadedModules.size() < 256) {
+                if (probe == 0x400000 && mainExeSize != 0) {
+                    ULONG_PTR step = ((ULONG_PTR)mainExeSize + 0xFFFFULL) & ~(ULONG_PTR)0xFFFFULL;
+                    probe += (step > 0 ? step : 0x10000ULL);
+                    continue;
+                }
+
+                ModuleInfo mod = {};
+                bool modIs64 = true;
+                bool isExe = false;
+                if (TryReadPeModuleStealth(pid, probe, &mod, &modIs64, &isExe)) {
+                    if (!modIs64 && probe < 0x80000000ULL) detected32Bit = true;
+                    if (isExe && !foundMainExe) {
+                        g_LoadedModules.insert(g_LoadedModules.begin(), mod);
+                        foundMainExe = true;
+                    }
+                    else {
+                        g_LoadedModules.push_back(mod);
+                    }
+                    ULONG_PTR step = ((ULONG_PTR)mod.Size + 0xFFFFULL) & ~(ULONG_PTR)0xFFFFULL;
+                    probe += (step > 0 ? step : 0x10000ULL);
+                }
+                else {
+                    probe += 0x10000ULL;
+                }
+            }
+        }
+
+        cursor = end;
+    }
+
+    if (outIs64) {
+        *outIs64 = !detected32Bit;
+    }
+}
+
+void FormatCurrentLocalTime(char* outBuf, size_t maxLen)
+{
+    if (!outBuf || maxLen == 0) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(outBuf, maxLen, "%02u:%02u:%02u", st.wHour, st.wMinute, st.wSecond);
+}
+
+void FormatElapsedDuration(ULONGLONG startTick, char* outBuf, size_t maxLen)
+{
+    if (!outBuf || maxLen == 0) return;
+    if (startTick == 0) {
+        snprintf(outBuf, maxLen, "00:00:00");
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG totalSec = (now >= startTick) ? ((now - startTick) / 1000ULL) : 0ULL;
+    ULONGLONG hours = totalSec / 3600ULL;
+    ULONGLONG mins = (totalSec % 3600ULL) / 60ULL;
+    ULONGLONG secs = totalSec % 60ULL;
+    snprintf(outBuf, maxLen, "%02llu:%02llu:%02llu", hours, mins, secs);
+}
+
+void ConnectToProcess(ULONG pid)
+{
+    ULONG prevPid = g_SelectedPid;
+    if (pid != prevPid) {
+        {
+            std::lock_guard<std::mutex> lock(g_ScanResultsLock);
+            g_ScanResults.clear();
+        }
+        g_ScanVersion++;
+        g_ScanTruncated = false;
+        g_ResolvedAddress = 0;
+        g_ResolvedValue = 0;
+        g_LastResolved = ResolvedPointer{};
+    }
+
+    if (pid == 0) {
+        g_SelectedPid = 0;
+        g_ProcessConnectTick = 0;
+        g_ProcessConnectTimeStr[0] = '\0';
+        g_LoadedModules.clear();
+        return;
+    }
+
+    bool isConquer = false;
+    for (const auto& p : g_ProcessList) {
+        if (p.ProcessId == pid && _stricmp(p.Name, "Conquer.exe") == 0) {
+            isConquer = true;
+            break;
+        }
+    }
+
+    g_SelectedPid = pid;
+    g_ProcessConnectTick = GetTickCount64();
+    FormatCurrentLocalTime(g_ProcessConnectTimeStr, sizeof(g_ProcessConnectTimeStr));
+
+    if (isConquer) {
+        // Passive initial tracking: do NOT open any handle or touch Conquer.exe memory yet;
+        // the Stealth Kernel Re-Attach will execute automatically after 0.5s (500ms).
+        g_LoadedModules.clear();
+        g_AutoConnectConquer = true;
+        g_SelectedIs64 = false; // Conquer.exe is 32-bit; refined stealthily at +0.5s
+        std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+        g_ConquerTrackedPid = pid;
+        g_ConquerConnectTick = g_ProcessConnectTick;
+        strcpy_s(g_ConquerConnectTimeStr, sizeof(g_ConquerConnectTimeStr), g_ProcessConnectTimeStr);
+        g_ConquerReattachPending = true;
+        g_ConquerReattachTargetTick = g_ProcessConnectTick + CONQUER_REATTACH_DELAY_MS;
+        g_ConquerReattachedAfterDelay = false;
+        return;
+    }
+
+    // Manual selection of a non-Conquer process: cancel any pending Conquer re-attach timer
+    {
+        std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+        g_ConquerReattachPending = false;
+        g_ConquerReattachedAfterDelay = false;
+    }
+
+    g_SelectedIs64 = IsTarget64Bit(pid);
+    if (g_hDriver != INVALID_HANDLE_VALUE) {
+        ULONG64 peProc = 0;
+        DbkGetPEPROCESS(pid, &peProc);
+    }
+    RefreshModules();
+}
+
+void ConquerWatchLoop()
+{
+    std::vector<ULONG> prevConquerPids;
+    ULONG lastKnownConquerPid = 0;
+
+    while (g_ConquerWatchRunning) {
+        if (!g_AutoConnectConquer) {
+            prevConquerPids.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            continue;
+        }
+
+        std::vector<ULONG> currentConquerPids;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, L"Conquer.exe") == 0) {
+                        currentConquerPids.push_back(pe.th32ProcessID);
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+
+        ULONG     trackedPid = 0;
+        bool      reattachPending = false;
+        ULONGLONG reattachTargetTick = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+            trackedPid = g_ConquerTrackedPid;
+            reattachPending = g_ConquerReattachPending;
+            reattachTargetTick = g_ConquerReattachTargetTick;
+        }
+
+        // Detect any newly spawned Conquer.exe instance
+        ULONG newSpawnedPid = 0;
+        for (ULONG pid : currentConquerPids) {
+            bool seenBefore = false;
+            for (ULONG oldPid : prevConquerPids) {
+                if (oldPid == pid) { seenBefore = true; break; }
+            }
+            if (!seenBefore) {
+                newSpawnedPid = pid;
+            }
+        }
+
+        // Check whether the currently tracked Conquer.exe PID is still alive
+        bool trackedStillAlive = false;
+        if (trackedPid != 0) {
+            for (ULONG pid : currentConquerPids) {
+                if (pid == trackedPid) { trackedStillAlive = true; break; }
+            }
+        }
+
+        ULONG targetPid = 0;
+        if (newSpawnedPid != 0) {
+            targetPid = newSpawnedPid;
+        }
+        else if (!trackedStillAlive && !currentConquerPids.empty()) {
+            targetPid = currentConquerPids.back();
+        }
+
+        ULONGLONG nowTick = GetTickCount64();
+
+        // Case 1: Initial Conquer.exe detection -> passively record PID (zero touch on the game process)
+        //         and arm the 0.5s (500ms) Stealth Kernel Re-Attach.
+        if (targetPid != 0 && targetPid != trackedPid) {
+            char timeBuf[32] = "";
+            FormatCurrentLocalTime(timeBuf, sizeof(timeBuf));
+
+            if (trackedPid != 0)
+                lastKnownConquerPid = trackedPid;
+
+            {
+                std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+                g_ConquerTrackedPid = targetPid;
+                g_ConquerConnectTick = nowTick;
+                strcpy_s(g_ConquerConnectTimeStr, sizeof(g_ConquerConnectTimeStr), timeBuf);
+                g_ConquerReattachPending = true;
+                g_ConquerReattachTargetTick = nowTick + CONQUER_REATTACH_DELAY_MS;
+                g_ConquerReattachedAfterDelay = false;
+            }
+            g_ConquerEventSeq++;
+            if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
+        }
+        // Case 2: 0.5 seconds (500ms) elapsed -> perform Stealth Kernel Re-Attach:
+        //         - ZERO OpenProcess calls
+        //         - ZERO CreateToolhelp32Snapshot(TH32CS_SNAPMODULE) calls
+        //         - ZERO ObOpenObjectByPointer (IOCTL_CE_OPENPROCESS) handle creations
+        //         - Uses only Ring-0 PsLookupProcessByProcessId + KeAttachProcess via DBK64
+        else if (reattachPending && nowTick >= reattachTargetTick && !currentConquerPids.empty()) {
+            ULONG reattachPid = trackedStillAlive ? trackedPid : currentConquerPids.back();
+            char timeBuf[32] = "";
+            FormatCurrentLocalTime(timeBuf, sizeof(timeBuf));
+
+            if (g_hDriver != INVALID_HANDLE_VALUE) {
+                ULONG64 peProc = 0;
+                ULONG64 cr3 = 0;
+                DbkGetPEPROCESS(reattachPid, &peProc);
+                DbkGetCR3(reattachPid, &cr3);
+                g_PeProcess = peProc;
+                g_KernelCR3 = cr3;
+            }
+
+            {
+                std::lock_guard<std::mutex> ctLock(g_CheatTableLock);
+                for (auto& item : g_CheatTable) {
+                    if (item.Pid == trackedPid || item.Pid == g_SelectedPid ||
+                        (lastKnownConquerPid != 0 && item.Pid == lastKnownConquerPid)) {
+                        item.Pid = reattachPid;
+                    }
+                }
+            }
+            lastKnownConquerPid = reattachPid;
+
+            {
+                std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+                g_ConquerTrackedPid = reattachPid;
+                g_ConquerConnectTick = nowTick;
+                strcpy_s(g_ConquerConnectTimeStr, sizeof(g_ConquerConnectTimeStr), timeBuf);
+                g_ConquerReattachPending = false;
+                g_ConquerReattachedAfterDelay = true;
+            }
+            g_ConquerReconnectCount++;
+            g_ConquerEventSeq++;
+            if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
+        }
+        // Case 3: Conquer.exe closed completely; clear tracked PID and wait for next launch
+        else if (trackedPid != 0 && !trackedStillAlive && currentConquerPids.empty()) {
+            lastKnownConquerPid = trackedPid;
+            {
+                std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+                g_ConquerTrackedPid = 0;
+                g_ConquerConnectTick = 0;
+                g_ConquerConnectTimeStr[0] = '\0';
+                g_ConquerReattachPending = false;
+                g_ConquerReattachedAfterDelay = false;
+            }
+            g_ConquerEventSeq++;
+            if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
+        }
+
+        prevConquerPids = std::move(currentConquerPids);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
 }
 
 // =====================================================================
@@ -1214,11 +1713,19 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
     }
 
     ULONG sz = GetDataSize(dataType);
+    ULONG_PTR defaultEnd = IsTarget64Bit(targetPid) ? 0x7FFFFFFFFFFFULL : 0xFFFFFFFFULL;
     ULONG_PTR rStart = useRange ? rangeStart : 0x10000;
-    ULONG_PTR rEnd = useRange ? rangeEnd : 0x7FFFFFFFFFFFULL;
+    ULONG_PTR rEnd = useRange ? rangeEnd : defaultEnd;
+
+    ULONG conquerPid = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+        conquerPid = g_ConquerTrackedPid;
+    }
 
     std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
-    if (regions.empty())
+    // Never fall back to user-mode OpenProcess when scanning Conquer.exe
+    if (regions.empty() && targetPid != conquerPid)
         regions = EnumerateRegionsUserMode(targetPid, rStart, rEnd);
 
     std::vector<ULONG_PTR> results;
@@ -1229,6 +1736,7 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
     for (auto& r : regions) {
         ULONG_PTR cur = r.Start;
         while (cur < r.End) {
+            if (!g_FreezeRunning) goto scan_done; // abort cleanly if app is closing
             ULONG_PTR remaining = r.End - cur;
             ULONG chunkSize = (ULONG)MinAddr(remaining, (ULONG_PTR)chunk.size());
 
@@ -1279,6 +1787,7 @@ void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std
 
     ULONG64 total = (ULONG64)prevResults.size(), done = 0;
     for (auto a : prevResults) {
+        if (!g_FreezeRunning) break; // abort cleanly if app is closing
         ULONG64 v = 0;
         if (DbkReadBytes(targetPid, a, &v, sz) && memcmp(&v, &searchVal64, sz) == 0)
             results.push_back(a);
@@ -1301,7 +1810,7 @@ void StartFirstScan()
     ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType);
     g_ResultsDataType = g_SelectedDataType;
     ULONG_PTR rStart = 0x10000;
-    ULONG_PTR rEnd = 0x7FFFFFFFFFFFULL;
+    ULONG_PTR rEnd = g_SelectedIs64 ? 0x7FFFFFFFFFFFULL : 0xFFFFFFFFULL;
     if (g_UseScanRange) {
         rStart = (ULONG_PTR)_strtoui64(g_ScanRangeStart, NULL, 0);
         rEnd = (ULONG_PTR)_strtoui64(g_ScanRangeEnd, NULL, 0);
@@ -1463,12 +1972,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
 
     // Initial fetch of processes & kernel info
+    RefreshProcessList();
     if (driverConnected) {
-        RefreshProcessList();
         DbkGetVersion(&g_KernelVersion);
     }
 
     g_FreezeThread = std::thread(FreezeLoop);
+    g_ConquerWatchThread = std::thread(ConquerWatchLoop);
 
     int lastWidth = 0, lastHeight = 0;
     glfwGetFramebufferSize(window, &lastWidth, &lastHeight);
@@ -1503,6 +2013,57 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::SetNextWindowSize(ImVec2((float)fbWidth, (float)fbHeight), ImGuiCond_Always);
         ImGui::Begin("Imno - DBK64 Kernel Suite", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
+        // Sync with ConquerWatchLoop (passive initial detection -> Stealth Kernel Re-Attach at +0.5s)
+        static unsigned s_LastConquerSeq = 0;
+        unsigned curConquerSeq = g_ConquerEventSeq.load();
+        if (curConquerSeq != s_LastConquerSeq) {
+            s_LastConquerSeq = curConquerSeq;
+            ULONG     cPid = 0;
+            ULONGLONG cTick = 0;
+            char      cTime[32] = "";
+            bool      reattachPending = false;
+            bool      reattachedAfterDelay = false;
+            {
+                std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+                cPid = g_ConquerTrackedPid;
+                cTick = g_ConquerConnectTick;
+                strcpy_s(cTime, sizeof(cTime), g_ConquerConnectTimeStr);
+                reattachPending = g_ConquerReattachPending;
+                reattachedAfterDelay = g_ConquerReattachedAfterDelay;
+            }
+            if (cPid != 0) {
+                if (g_SelectedPid != cPid) {
+                    std::lock_guard<std::mutex> lock(g_ScanResultsLock);
+                    g_ScanResults.clear();
+                    g_ScanVersion++;
+                    g_ScanTruncated = false;
+                }
+                RefreshProcessList();
+                g_SelectedPid = cPid;
+                g_ProcessConnectTick = cTick;
+                strcpy_s(g_ProcessConnectTimeStr, sizeof(g_ProcessConnectTimeStr), cTime);
+
+                if (reattachedAfterDelay && !reattachPending) {
+                    // +0.5s Stealth Kernel Re-Attach: resolve modules & bitness purely via Ring-0 memory reads
+                    // (zero OpenProcess, zero CreateToolhelp32Snapshot(TH32CS_SNAPMODULE), zero handles)
+                    if (g_hDriver != INVALID_HANDLE_VALUE) {
+                        RefreshModulesStealth(cPid, &g_SelectedIs64);
+                    }
+                    else {
+                        g_SelectedIs64 = false;
+                    }
+                }
+                else {
+                    // Initial 0.5s window: stay completely silent / invisible to the game
+                    g_LoadedModules.clear();
+                    g_SelectedIs64 = false;
+                }
+            }
+            else if (g_AutoConnectConquer) {
+                ConnectToProcess(0);
+            }
+        }
+
         // Top Bar: Driver Status Active/Inactive & Process Combo
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) {
@@ -1514,7 +2075,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             if (ImGui::Button("Reconnect")) {
                 LoadAndStartDriver();
                 driverConnected = ConnectDriver();
-                if (driverConnected) RefreshProcessList();
+                if (driverConnected) {
+                    DbkGetVersion(&g_KernelVersion);
+                    RefreshProcessList();
+                    if (g_SelectedPid != 0) {
+                        ConnectToProcess(g_SelectedPid);
+                    }
+                }
             }
         }
 
@@ -1524,19 +2091,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         }
 
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(150);
+        ImGui::SetNextItemWidth(130);
         ImGui::InputText("Filter", g_ProcessFilter, sizeof(g_ProcessFilter));
         ImGui::SameLine();
 
-        ImGui::SetNextItemWidth(260);
+        ImGui::SetNextItemWidth(230);
         char comboLabel[128];
+        const char* selectedProcName = NULL;
         strcpy_s(comboLabel, sizeof(comboLabel), "Select Target Process...");
         if (g_SelectedPid != 0) {
-            const char* foundName = NULL;
             for (const auto& p : g_ProcessList) {
-                if (p.ProcessId == g_SelectedPid) { foundName = p.Name; break; }
+                if (p.ProcessId == g_SelectedPid) { selectedProcName = p.Name; break; }
             }
-            if (foundName) sprintf_s(comboLabel, sizeof(comboLabel), "%s (%u)", foundName, g_SelectedPid);
+            if (selectedProcName) sprintf_s(comboLabel, sizeof(comboLabel), "%s (%u)", selectedProcName, g_SelectedPid);
             else sprintf_s(comboLabel, sizeof(comboLabel), "PID %u", g_SelectedPid);
         }
         if (ImGui::BeginCombo("##proccombo", comboLabel)) {
@@ -1546,9 +2113,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 sprintf_s(label, sizeof(label), "%s (%u)", p.Name, p.ProcessId);
                 bool isSelected = (g_SelectedPid == p.ProcessId);
                 if (ImGui::Selectable(label, isSelected)) {
-                    g_SelectedPid = p.ProcessId;
-                    g_SelectedIs64 = IsTarget64Bit(p.ProcessId);
-                    RefreshModules();
+                    ConnectToProcess(p.ProcessId);
                 }
                 if (isSelected) ImGui::SetItemDefaultFocus();
             }
@@ -1556,10 +2121,75 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         }
 
         ImGui::SameLine();
+        ImGui::Checkbox("Auto Conquer.exe", &g_AutoConnectConquer);
+
+        ImGui::SameLine();
+        static ULONGLONG s_LastTitleUpdate = 0;
+        static ULONG     s_LastTitlePid = 0;
         if (g_SelectedPid != 0) {
+            ULONG uiConquerPid = 0;
+            bool  uiReattachPending = false;
+            bool  uiReattachedAfterDelay = false;
+            {
+                std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+                uiConquerPid = g_ConquerTrackedPid;
+                uiReattachPending = g_ConquerReattachPending;
+                uiReattachedAfterDelay = g_ConquerReattachedAfterDelay;
+            }
+
+            char elapsedStr[32];
+            FormatElapsedDuration(g_ProcessConnectTick, elapsedStr, sizeof(elapsedStr));
+
             ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "PID: %u", g_SelectedPid);
             ImGui::SameLine();
             ImGui::TextDisabled("(%s)", g_SelectedIs64 ? "64-bit" : "32-bit");
+            if (ImGui::GetContentRegionAvail().x > 260.0f) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("|");
+                ImGui::SameLine();
+            }
+            ImGui::TextColored({ 0.3f, 0.9f, 1.0f, 1.0f }, "Connected: %s", g_ProcessConnectTimeStr);
+            ImGui::SameLine();
+            ImGui::TextColored({ 1.0f, 0.85f, 0.2f, 1.0f }, "[Elapsed: %s]", elapsedStr);
+            if (uiConquerPid == g_SelectedPid) {
+                ImGui::SameLine();
+                if (uiReattachPending)
+                    ImGui::TextColored({ 1.0f, 0.6f, 0.2f, 1.0f }, "(Stealth Re-attach in 0.5s...)");
+                else if (uiReattachedAfterDelay)
+                    ImGui::TextColored({ 0.2f, 1.0f, 0.4f, 1.0f }, "(Stealth Re-attached +0.5s)");
+            }
+
+            ULONGLONG nowTick = GetTickCount64();
+            if (s_LastTitlePid != g_SelectedPid || (nowTick - s_LastTitleUpdate >= 1000)) {
+                s_LastTitleUpdate = nowTick;
+                s_LastTitlePid = g_SelectedPid;
+                char winTitle[256];
+                if (uiConquerPid == g_SelectedPid) {
+                    // Stealth window title: avoid exposing "Conquer.exe" or "DBK64" to window-title scanners
+                    snprintf(winTitle, sizeof(winTitle),
+                        "Imno | Connected: %s [Elapsed: %s]",
+                        g_ProcessConnectTimeStr,
+                        elapsedStr);
+                }
+                else {
+                    snprintf(winTitle, sizeof(winTitle),
+                        "Imno - DBK64 Kernel Suite | %s (%u) - Connected: %s [%s]",
+                        selectedProcName ? selectedProcName : "Process",
+                        g_SelectedPid,
+                        g_ProcessConnectTimeStr,
+                        elapsedStr);
+                }
+                glfwSetWindowTitle(window, winTitle);
+            }
+        }
+        else {
+            if (g_AutoConnectConquer) {
+                ImGui::TextColored({ 1.0f, 0.85f, 0.2f, 1.0f }, "[Waiting for Conquer.exe...]");
+            }
+            if (s_LastTitlePid != 0) {
+                s_LastTitlePid = 0;
+                glfwSetWindowTitle(window, "Imno - DBK64 Kernel Suite");
+            }
         }
 
         ImGui::Separator();
@@ -1839,7 +2469,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                 if (ImGui::CollapsingHeader("MSR (Model Specific Registers)")) {
                     ImGui::SetNextItemWidth(200);
-                    ImGui::InputText("MSR index", g_MsrReadInput, sizeof(g_MsrReadInput));
+                    ImGui::InputText("MSR index##read", g_MsrReadInput, sizeof(g_MsrReadInput));
                     ImGui::SameLine();
                     if (ImGui::Button("Read MSR", ImVec2(90, 24))) {
                         ULONG msr = (ULONG)_strtoui64(g_MsrReadInput, NULL, 0);
@@ -1849,7 +2479,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                     ImGui::Separator();
                     ImGui::SetNextItemWidth(200);
-                    ImGui::InputText("MSR index", g_MsrWriteMsr, sizeof(g_MsrWriteMsr));
+                    ImGui::InputText("MSR index##write", g_MsrWriteMsr, sizeof(g_MsrWriteMsr));
                     ImGui::SetNextItemWidth(200);
                     ImGui::InputText("New value", g_MsrWriteValue, sizeof(g_MsrWriteValue));
                     ImGui::SameLine();
@@ -1875,7 +2505,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                 if (ImGui::CollapsingHeader("Physical Memory")) {
                     ImGui::SetNextItemWidth(200);
-                    ImGui::InputText("Physical address", g_PhysReadAddr, sizeof(g_PhysReadAddr));
+                    ImGui::InputText("Physical address##read", g_PhysReadAddr, sizeof(g_PhysReadAddr));
                     ImGui::SetNextItemWidth(120);
                     ImGui::InputText("Bytes", g_PhysReadSize, sizeof(g_PhysReadSize));
                     ImGui::SameLine();
@@ -1893,7 +2523,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                     ImGui::Separator();
                     ImGui::SetNextItemWidth(200);
-                    ImGui::InputText("Physical address", g_PhysWriteAddr, sizeof(g_PhysWriteAddr));
+                    ImGui::InputText("Physical address##write", g_PhysWriteAddr, sizeof(g_PhysWriteAddr));
                     ImGui::SetNextItemWidth(340);
                     ImGui::InputText("Hex bytes (0x90, 0x90 ...)", g_PhysWriteHex, sizeof(g_PhysWriteHex));
                     ImGui::SameLine();
@@ -1969,70 +2599,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::EndTabItem();
             }
 
-            // TAB 6: COSERVER (Cheat Engine bridge)
-            if (ImGui::BeginTabItem("CoServer"))
-            {
-                ImGui::BeginChild("CoServerChild", ImVec2(0, 0), false);
-
-                ImGui::TextWrapped(
-                    "Run a Cheat Engine CEServer on this machine. In Cheat Engine, "
-                    "open Process List -> Network, enter this PC's IP and port, and "
-                    "connect. All memory reads/writes are served through DBK64.");
-
-                ImGui::Spacing();
-
-                bool running = CEServerIsRunning();
-                ImGui::Text("Status: ");
-                ImGui::SameLine();
-                if (running)
-                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "RUNNING  (port %d, %d client%s)",
-                        CEServerPort(), CEServerClientCount(), CEServerClientCount() == 1 ? "" : "s");
-                else
-                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "STOPPED");
-
-                ImGui::SetNextItemWidth(160);
-                ImGui::InputText("Port", g_CoServerPort, sizeof(g_CoServerPort));
-
-                if (!running)
-                {
-                    if (ImGui::Button("Start Server", ImVec2(120, 26)))
-                    {
-                        int port = atoi(g_CoServerPort);
-                        if (port < 1 || port > 65535) port = 52736;
-                        if (!CEServerStart(port))
-                            ImGui::OpenPopup("ceserver_bind_failed");
-                    }
-                }
-                else
-                {
-                    if (ImGui::Button("Stop Server", ImVec2(120, 26)))
-                        CEServerStop();
-                }
-
-                if (ImGui::BeginPopupModal("ceserver_bind_failed", NULL, ImGuiWindowFlags_AlwaysAutoResize))
-                {
-                    ImGui::Text("Could not start the server.\nIs the port already in use?");
-                    if (ImGui::Button("OK", ImVec2(120, 0)))
-                        ImGui::CloseCurrentPopup();
-                    ImGui::EndPopup();
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Log:");
-                ImGui::BeginChild("CoServerLogChild", ImVec2(0, 0), true);
-                std::vector<std::string> log;
-                CEServerGetLog(log);
-                for (auto& line : log)
-                    ImGui::TextUnformatted(line.c_str());
-                // Auto-scroll to the latest entry.
-                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.0f)
-                    ImGui::SetScrollHereY(1.0f);
-                ImGui::EndChild();
-
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-
             ImGui::EndTabBar();
         }
 
@@ -2057,7 +2623,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
     // Cleanup
     g_FreezeRunning = false;
+    g_ConquerWatchRunning = false;
     if (g_FreezeThread.joinable()) g_FreezeThread.join();
+    if (g_ConquerWatchThread.joinable()) g_ConquerWatchThread.join();
+    for (int waitIdx = 0; waitIdx < 200 && g_IsScanning; ++waitIdx) {
+        Sleep(10);
+    }
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -2070,8 +2641,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
     glfwDestroyWindow(window);
     glfwTerminate();
-
-    CEServerStop();
 
     DisconnectDriver();
     StopAndUnloadDriver();

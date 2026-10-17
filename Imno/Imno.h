@@ -260,8 +260,13 @@ bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* 
 //  Workers / UI
 // =====================================================================
 void FreezeLoop();
+void ConquerWatchLoop();
 void RefreshProcessList();
 void RefreshModules();
+void RefreshModulesStealth(ULONG pid, bool* outIs64 = NULL);
+void ConnectToProcess(ULONG pid);
+void FormatCurrentLocalTime(char* outBuf, size_t maxLen);
+void FormatElapsedDuration(ULONGLONG startTick, char* outBuf, size_t maxLen);
 
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned);
 void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std::vector<ULONG_PTR> prevResults);
