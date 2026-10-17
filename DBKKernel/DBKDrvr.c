@@ -413,6 +413,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
 
 	DbgPrint("Initializing debugger\n");
 	debugger_initialize();
+	StealthFreeze_Init();
 
 
 	// Return success (don't do the devicestring, I need it for unload)
@@ -594,6 +595,7 @@ NTSTATUS DispatchClose(IN PDEVICE_OBJECT DeviceObject,
 
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
+	StealthFreeze_Shutdown();
 	cleanupDBVM();
 	
 	if (!debugger_stopDebugging())

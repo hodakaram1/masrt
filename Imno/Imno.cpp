@@ -50,11 +50,19 @@ std::atomic<unsigned>  g_ScanVersion(0);    // bumped whenever results change
 int                    g_ResultsDataType = 4; // data type of the results currently shown
 bool                   g_SelectedIs64 = true; // bitness of the selected target process
 
-// Cheat Table & Freeze
+// Cheat Table & Stealth Kernel Freeze
 std::vector<CheatItem> g_CheatTable;
 std::mutex g_CheatTableLock;
 std::atomic<bool> g_FreezeRunning(true);
 std::thread g_FreezeThread;
+bool g_StealthFreezeReadBeforeWrite = true;
+bool g_StealthFreezeUsePhysical = true;
+bool g_StealthFreezeIgnoreWP = false;
+std::atomic<bool> g_KernelAutonomousFreezeActive(false);
+std::atomic<unsigned> g_CheatTableDirtySeq(1);
+char g_ManualFreezeAddrInput[128] = "";
+char g_ManualFreezeValInput[64] = "100";
+char g_ManualFreezeDescInput[64] = "Stealth Freeze";
 
 // Auto-Reconnect Conquer.exe (with automatic 0.5s / 500ms re-attach)
 #define CONQUER_REATTACH_DELAY_MS 500ULL
@@ -1015,9 +1023,26 @@ bool DbkGetGdt(USHORT* limit, ULONG_PTR* base)
     return false;
 }
 
+bool DbkGetPhysicalAddress(ULONG pid, ULONG_PTR virtualAddr, ULONG64* outPhysAddr)
+{
+    if (outPhysAddr) *outPhysAddr = 0;
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || virtualAddr == 0)
+        return false;
+
+    DBK_VA_TO_PA buf = {};
+    buf.ProcessId = pid;
+    buf.BaseAddress = virtualAddr;
+    if (!DbkIoctl(IOCTL_CE_GETPHYSICALADDRESS, &buf, sizeof(buf), &buf, sizeof(buf)))
+        return false;
+
+    ULONG64 pa = buf.ProcessId; // first 8 bytes of SystemBuffer hold physical.QuadPart
+    if (outPhysAddr) *outPhysAddr = pa;
+    return pa != 0;
+}
+
 bool DbkReadPhysical(ULONG64 addr, void* out, ULONG size)
 {
-    if (size == 0 || size > 0x2000 || out == NULL) return false;   // driver maps a 0x2000 view
+    if (size == 0 || size > 0x2000 || out == NULL || addr == 0) return false;
     DBK_PHYS_RW req;
     req.Address = addr;
     req.Bytes = size;
@@ -1026,13 +1051,59 @@ bool DbkReadPhysical(ULONG64 addr, void* out, ULONG size)
 
 bool DbkWritePhysical(ULONG64 addr, const void* in, ULONG size)
 {
-    if (size == 0 || size > 0x2000 || in == NULL) return false;
+    if (size == 0 || size > 0x2000 || in == NULL || addr == 0) return false;
     ULONG total = sizeof(DBK_PHYS_RW) + size;
     std::vector<BYTE> buf(total, 0);
     *(ULONG64*)(&buf[0]) = addr;
     *(ULONG64*)(&buf[8]) = size;
     memcpy(&buf[sizeof(DBK_PHYS_RW)], in, size);
     return DbkIoctl(IOCTL_CE_WRITEPHYSICALMEMORY, buf.data(), total, NULL, 0, NULL);
+}
+
+bool DbkSetWritesIgnoreWP(bool enable)
+{
+    UCHAR flag = enable ? 1 : 0;
+    return DbkIoctl(IOCTL_CE_WRITESIGNOREWP, &flag, sizeof(flag), NULL, 0, NULL);
+}
+
+bool DbkSyncStealthFreeze()
+{
+    if (g_hDriver == INVALID_HANDLE_VALUE) {
+        g_KernelAutonomousFreezeActive = false;
+        return false;
+    }
+
+    ULONG conquerPid = 0;
+    bool  conquerPending = false;
+    {
+        std::lock_guard<std::mutex> lock(g_ConquerWatchLock);
+        conquerPid = g_ConquerTrackedPid;
+        conquerPending = g_ConquerReattachPending;
+    }
+
+    DBK_STEALTH_FREEZE_LIST list = {};
+    {
+        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+        for (const auto& item : g_CheatTable) {
+            if (!item.Enabled || item.Pid == 0 || item.Address == 0)
+                continue;
+            if (conquerPending && item.Pid == conquerPid)
+                continue; // keep 0.5s passive window completely untouched
+            if (list.Count >= DBK_MAX_STEALTH_FREEZE_ENTRIES)
+                break;
+
+            DBK_STEALTH_FREEZE_ENTRY& e = list.Entries[list.Count++];
+            e.ProcessId = item.Pid;
+            e.Address   = item.Address;
+            e.Value64   = item.Value64;
+            e.Size      = GetDataSize(item.DataType);
+            e.Enabled   = 1;
+        }
+    }
+
+    bool ok = DbkIoctl(IOCTL_CE_STEALTH_FREEZE_SYNC, &list, sizeof(list), NULL, 0, NULL);
+    g_KernelAutonomousFreezeActive = ok && (list.Count > 0);
+    return ok;
 }
 
 bool DbkAllocNonPaged(ULONG size, ULONG64* out)
@@ -1108,20 +1179,105 @@ bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* 
 }
 
 // =====================================================================
-//  Freeze / Cheat Table Loop
+//  Stealth Kernel Freeze Loop
+//  - Synchronizes with the Ring-0 Autonomous Freeze Thread (IOCTL_CE_STEALTH_FREEZE_SYNC)
+//  - Performs Read-Before-Write Conditional Freezing (writes ONLY when the target
+//    modifies the frozen value, preventing redundant page-table dirty bit flips
+//    and write-watch triggers)
+//  - Uses direct Physical RAM reads/writes (\Device\PhysicalMemory via PA) when
+//    available, with automatic Ring-0 virtual memory fallback
+//  - Respects the +0.5s Conquer.exe passive stealth window
+//  - Uses micro-jittered intervals (8ms..18ms) to defeat periodic timing checks
 // =====================================================================
+static bool CanUsePhysicalDirectSafe(ULONG64 physAddr, ULONG size)
+{
+    if (physAddr == 0 || size == 0) return false;
+    // Stay within a single 4KB page and within the 0x2000 legacy section-map window
+    // so both newly built and older pre-signed DBK64.sys binaries are 100% safe.
+    if (((physAddr & 0xFFFULL) + size) > 0x1000ULL) return false;
+    if (((physAddr & 0xFFFFULL) + size) > 0x2000ULL) return false;
+    return true;
+}
+
 void FreezeLoop()
 {
+    unsigned lastSyncedSeq = 0;
+    ULONG jitterState = (ULONG)GetTickCount64() ^ 0xA5A5F00DUL;
+
     while (g_FreezeRunning) {
         if (g_hDriver != INVALID_HANDLE_VALUE) {
+            unsigned curSeq = g_CheatTableDirtySeq.load();
+            if (curSeq != lastSyncedSeq) {
+                lastSyncedSeq = curSeq;
+                DbkSyncStealthFreeze();
+            }
+
+            ULONG conquerPid = 0;
+            bool  conquerPending = false;
+            {
+                std::lock_guard<std::mutex> wlock(g_ConquerWatchLock);
+                conquerPid = g_ConquerTrackedPid;
+                conquerPending = g_ConquerReattachPending;
+            }
+
             std::lock_guard<std::mutex> lock(g_CheatTableLock);
             for (auto& item : g_CheatTable) {
-                if (item.Enabled && item.Pid != 0) {
-                    WriteMemory(item.Pid, item.Address, item.Value64, item.DataType);
+                if (!item.Enabled || item.Pid == 0 || item.Address == 0)
+                    continue;
+
+                // Never touch Conquer.exe during the initial 0.5s (500ms) passive stealth window
+                if (conquerPending && item.Pid == conquerPid)
+                    continue;
+
+                ULONG sz = GetDataSize(item.DataType);
+                if (sz == 0 || sz > 8) sz = 4;
+
+                // Resolve and cache Physical RAM Address (PA) in Ring-0 if not cached yet
+                if (item.PhysicalAddress == 0) {
+                    DbkGetPhysicalAddress(item.Pid, item.Address, &item.PhysicalAddress);
+                }
+
+                bool usePhys = g_StealthFreezeUsePhysical && CanUsePhysicalDirectSafe(item.PhysicalAddress, sz);
+
+                if (g_StealthFreezeReadBeforeWrite) {
+                    ULONG64 curVal = 0;
+                    bool readOk = false;
+                    if (usePhys) {
+                        readOk = DbkReadPhysical(item.PhysicalAddress, &curVal, sz);
+                    }
+                    if (!readOk) {
+                        readOk = DbkReadBytes(item.Pid, item.Address, &curVal, sz);
+                    }
+
+                    // Only write if the target process actually changed the value!
+                    if (readOk && memcmp(&curVal, &item.Value64, sz) == 0) {
+                        continue;
+                    }
+                }
+
+                bool wroteOk = false;
+                if (usePhys) {
+                    wroteOk = DbkWritePhysical(item.PhysicalAddress, &item.Value64, sz);
+                }
+                if (!wroteOk) {
+                    wroteOk = DbkWriteBytes(item.Pid, item.Address, &item.Value64, sz);
+                }
+                if (wroteOk) {
+                    item.WriteHits++;
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Micro-jittered stealth interval: 8ms .. 18ms (non-periodic)
+        jitterState = jitterState * 1664525UL + 1013904223UL;
+        ULONG sleepMs = 8 + (jitterState % 11);
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+    }
+
+    // Clear Ring-0 autonomous freeze table on exit
+    if (g_hDriver != INVALID_HANDLE_VALUE) {
+        DBK_STEALTH_FREEZE_LIST emptyList = {};
+        DbkIoctl(IOCTL_CE_STEALTH_FREEZE_SYNC, &emptyList, sizeof(emptyList), NULL, 0, NULL);
     }
 }
 
@@ -1528,6 +1684,7 @@ void ConquerWatchLoop()
                 g_ConquerReattachTargetTick = nowTick + CONQUER_REATTACH_DELAY_MS;
                 g_ConquerReattachedAfterDelay = false;
             }
+            g_CheatTableDirtySeq++;
             g_ConquerEventSeq++;
             if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
         }
@@ -1556,6 +1713,7 @@ void ConquerWatchLoop()
                     if (item.Pid == trackedPid || item.Pid == g_SelectedPid ||
                         (lastKnownConquerPid != 0 && item.Pid == lastKnownConquerPid)) {
                         item.Pid = reattachPid;
+                        item.PhysicalAddress = 0; // re-resolve physical address for the new process instance
                     }
                 }
             }
@@ -1569,6 +1727,7 @@ void ConquerWatchLoop()
                 g_ConquerReattachPending = false;
                 g_ConquerReattachedAfterDelay = true;
             }
+            g_CheatTableDirtySeq++;
             g_ConquerReconnectCount++;
             g_ConquerEventSeq++;
             if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
@@ -1584,6 +1743,7 @@ void ConquerWatchLoop()
                 g_ConquerReattachPending = false;
                 g_ConquerReattachedAfterDelay = false;
             }
+            g_CheatTableDirtySeq++;
             g_ConquerEventSeq++;
             if (g_hWnd) PostMessageA(g_hWnd, WM_NULL, 0, 0);
         }
@@ -2230,10 +2390,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                             char label[160];
                             sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i);
                             if (ImGui::Selectable(label)) {
+                                ULONG64 pa = 0;
+                                DbkGetPhysicalAddress(g_SelectedPid, s_DisplayAddrs[i], &pa);
                                 std::lock_guard<std::mutex> lock(g_CheatTableLock);
                                 std::string autoDesc = GetAutoOffsetForAddress(s_DisplayAddrs[i]);
-                                g_CheatTable.push_back({ s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, "" });
-                                strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), autoDesc.c_str());
+                                CheatItem newItem = { s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, "", pa, 0 };
+                                strcpy_s(newItem.Description, sizeof(newItem.Description), autoDesc.c_str());
+                                g_CheatTable.push_back(newItem);
+                                g_CheatTableDirtySeq++;
                             }
                         }
                     }
@@ -2247,12 +2411,53 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::EndTabItem();
             }
 
-            // TAB 2: CHEAT TABLE
+            // TAB 2: CHEAT TABLE (STEALTH KERNEL FREEZE)
             if (ImGui::BeginTabItem("Cheat Table"))
             {
-                ImGui::Text("Cheat Table (Active Freeze & Patches):");
+                ImGui::TextColored({ 0.2f, 1.0f, 0.5f, 1.0f }, "[Stealth Kernel Freeze Engine]");
+                ImGui::SameLine();
+                if (g_KernelAutonomousFreezeActive.load()) {
+                    ImGui::TextColored({ 0.3f, 0.9f, 1.0f, 1.0f }, "(Ring-0 Autonomous Thread + Conditional Physical/Kernel Freeze)");
+                }
+                else {
+                    ImGui::TextDisabled("(Conditional Read-Before-Write + Physical RAM / Ring-0 + Micro-Jitter)");
+                }
 
-                ImGui::BeginChild("CheatTableChild", ImVec2(0, 300), true);
+                ImGui::Checkbox("Read-Before-Write (Stealth: write only on change)", &g_StealthFreezeReadBeforeWrite);
+                ImGui::SameLine();
+                ImGui::Checkbox("Physical RAM Direct (PA)", &g_StealthFreezeUsePhysical);
+                ImGui::SameLine();
+                if (ImGui::Checkbox("CR0.WP Ring-0 Bypass", &g_StealthFreezeIgnoreWP)) {
+                    DbkSetWritesIgnoreWP(g_StealthFreezeIgnoreWP);
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Add Stealth Freeze:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(180);
+                ImGui::InputText("Address##manfreeze", g_ManualFreezeAddrInput, sizeof(g_ManualFreezeAddrInput));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110);
+                ImGui::InputText("Value##manfreeze", g_ManualFreezeValInput, sizeof(g_ManualFreezeValInput));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(150);
+                ImGui::InputText("Desc##manfreeze", g_ManualFreezeDescInput, sizeof(g_ManualFreezeDescInput));
+                ImGui::SameLine();
+                if (ImGui::Button("+ Add Freeze", ImVec2(110, 24)) && g_SelectedPid != 0) {
+                    ULONG_PTR addr = ParseAddressInput(g_ManualFreezeAddrInput);
+                    if (addr != 0) {
+                        ULONG64 val64 = ParseInputToValue(g_ManualFreezeValInput, g_SelectedDataType);
+                        ULONG64 pa = 0;
+                        DbkGetPhysicalAddress(g_SelectedPid, addr, &pa);
+                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        CheatItem item = { addr, val64, true, g_SelectedDataType, g_SelectedPid, "", pa, 0 };
+                        strcpy_s(item.Description, sizeof(item.Description), g_ManualFreezeDescInput);
+                        g_CheatTable.push_back(item);
+                        g_CheatTableDirtySeq++;
+                    }
+                }
+
+                ImGui::BeginChild("CheatTableChild", ImVec2(0, 320), true);
                 {
                     std::lock_guard<std::mutex> lock(g_CheatTableLock);
                     for (int i = 0; i < (int)g_CheatTable.size(); i++) {
@@ -2261,27 +2466,46 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                         bool isEnabled = g_CheatTable[i].Enabled;
                         if (ImGui::Checkbox("##en", &isEnabled)) {
                             g_CheatTable[i].Enabled = isEnabled;
+                            if (isEnabled && g_CheatTable[i].PhysicalAddress == 0) {
+                                DbkGetPhysicalAddress(g_CheatTable[i].Pid, g_CheatTable[i].Address, &g_CheatTable[i].PhysicalAddress);
+                            }
+                            g_CheatTableDirtySeq++;
                         }
                         ImGui::SameLine();
 
-                        ImGui::Text("0x%llX [PID %u]", g_CheatTable[i].Address, g_CheatTable[i].Pid);
-                        ImGui::SameLine(220);
+                        if (g_CheatTable[i].PhysicalAddress != 0) {
+                            ImGui::Text("VA: 0x%llX [PA: 0x%llX | PID %u]",
+                                (unsigned long long)g_CheatTable[i].Address,
+                                (unsigned long long)g_CheatTable[i].PhysicalAddress,
+                                g_CheatTable[i].Pid);
+                        }
+                        else {
+                            ImGui::Text("VA: 0x%llX [Ring-0 | PID %u]",
+                                (unsigned long long)g_CheatTable[i].Address,
+                                g_CheatTable[i].Pid);
+                        }
+                        ImGui::SameLine(340);
 
                         char valStr[64];
                         FormatValueToString(g_CheatTable[i].Value64, g_CheatTable[i].DataType, valStr, sizeof(valStr));
 
-                        ImGui::SetNextItemWidth(140);
+                        ImGui::SetNextItemWidth(130);
                         if (ImGui::InputText("##val", valStr, sizeof(valStr))) {
                             g_CheatTable[i].Value64 = ParseInputToValue(valStr, g_CheatTable[i].DataType);
+                            g_CheatTableDirtySeq++;
                         }
 
-                        ImGui::SameLine(380);
-                        ImGui::SetNextItemWidth(180);
+                        ImGui::SameLine(480);
+                        ImGui::SetNextItemWidth(160);
                         ImGui::InputText("##desc", g_CheatTable[i].Description, sizeof(g_CheatTable[i].Description));
 
-                        ImGui::SameLine(570);
+                        ImGui::SameLine(650);
+                        ImGui::TextColored({ 0.4f, 0.9f, 1.0f, 1.0f }, "Restored: %u", g_CheatTable[i].WriteHits);
+
+                        ImGui::SameLine(760);
                         if (ImGui::Button("Remove")) {
                             g_CheatTable.erase(g_CheatTable.begin() + i--);
+                            g_CheatTableDirtySeq++;
                         }
 
                         ImGui::PopID();
@@ -2377,6 +2601,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     char resolvedStr[64];
                     FormatValueToString(g_ResolvedValue, 0, resolvedStr, sizeof(resolvedStr));
                     ImGui::Text("Value: %s (0x%llX)", resolvedStr, g_ResolvedValue);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Stealth Freeze Resolved Address", ImVec2(220, 24)) && g_SelectedPid != 0) {
+                        ULONG64 pa = 0;
+                        DbkGetPhysicalAddress(g_SelectedPid, g_ResolvedAddress, &pa);
+                        std::lock_guard<std::mutex> lock(g_CheatTableLock);
+                        CheatItem item = { g_ResolvedAddress, g_ResolvedValue, true, g_SelectedDataType, g_SelectedPid, "", pa, 0 };
+                        strcpy_s(item.Description, sizeof(item.Description), "Resolved Pointer Freeze");
+                        g_CheatTable.push_back(item);
+                        g_CheatTableDirtySeq++;
+                    }
                 }
 
                 ImGui::EndTabItem();

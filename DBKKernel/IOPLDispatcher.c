@@ -661,8 +661,8 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					pinp2=(UCHAR *)pinp;
 					viewBase.QuadPart = (ULONGLONG)(pinp->startaddress);					
 					
-					length=0x2000;//pinp->bytestoread;
 					toread=(UINT_PTR)pinp->bytestoread;
+					length=((UINT_PTR)(pinp->startaddress) & 0xFFFF) + toread + 0x1000;
 
 					memoryview=NULL;
 					ntStatus=ZwMapViewOfSection(
@@ -677,10 +677,17 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 						0,
 						PAGE_READWRITE);
 
-					if (ntStatus==STATUS_SUCCESS)
+					if ((ntStatus==STATUS_SUCCESS) && (memoryview!=NULL))
 					{
                         offset=(UINT_PTR)(pinp->startaddress)-(UINT_PTR)viewBase.QuadPart;
-						RtlCopyMemory(&memoryview[offset],&pinp2[16],toread);
+						if (offset + toread <= length)
+						{
+							RtlCopyMemory(&memoryview[offset],&pinp2[16],toread);
+						}
+						else
+						{
+							ntStatus=STATUS_UNSUCCESSFUL;
+						}
 
 						ZwUnmapViewOfSection(
 							NtCurrentProcess(), //processhandle
@@ -2513,6 +2520,13 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			}
 
 
+			break;
+		}
+
+		case IOCTL_CE_STEALTH_FREEZE_SYNC:
+		{
+			ULONG inLen = irpStack ? irpStack->Parameters.DeviceIoControl.InputBufferLength : sizeof(DBK_STEALTH_FREEZE_LIST);
+			ntStatus = StealthFreeze_Sync(Irp->AssociatedIrp.SystemBuffer, inLen);
 			break;
 		}
 

@@ -8,6 +8,7 @@
 #endif
 #include "memscan.h"
 #include "DBKFunc.h"
+#include "IOPLDispatcher.h"
 
 #include "vmxhelper.h"
 #include "vmxoffload.h" //PTE structs
@@ -538,8 +539,8 @@ NTSTATUS ReadPhysicalMemory(char *startaddress, UINT_PTR bytestoread, void *outp
 
 			viewBase.QuadPart = (ULONGLONG)(startaddress);					
 			
-			length=0x2000;//pinp->bytestoread; //in case of a overlapping region
 			toread=bytestoread;
+			length=((UINT_PTR)(startaddress) & 0xFFFF) + toread + 0x1000; // cover 64KB section alignment offset + overlap
 
 			memoryview=NULL;
 
@@ -1324,4 +1325,152 @@ BOOLEAN GetMemoryRegionData(DWORD PID,PEPROCESS PEProcess, PVOID mempointer,ULON
 	}
 
 	return 0; 
+}
+
+// =====================================================================
+//  Ring-0 Autonomous Stealth Freeze Engine
+//  - Runs inside a kernel system thread (PsCreateSystemThread)
+//  - Performs Read-Before-Write conditional freezing in Ring-0 so
+//    memory is only written at the instant the target modifies the value
+//  - Uses micro-jittered kernel sleep intervals
+// =====================================================================
+static FAST_MUTEX               g_StealthFreezeMutex;
+static BOOLEAN                  g_StealthFreezeMutexInited = FALSE;
+static volatile LONG            g_StealthFreezeStop = 0;
+static PKTHREAD                 g_StealthFreezeThreadObj = NULL;
+static DBK_STEALTH_FREEZE_ENTRY g_StealthFreezeEntries[DBK_MAX_STEALTH_FREEZE_ENTRIES];
+static ULONG                    g_StealthFreezeCount = 0;
+
+static VOID StealthFreezeKernelThread(IN PVOID StartContext)
+{
+	ULONG jitterSeed = 0x9E3779B9UL;
+	UNREFERENCED_PARAMETER(StartContext);
+
+	while (InterlockedCompareExchange(&g_StealthFreezeStop, 0, 0) == 0)
+	{
+		DBK_STEALTH_FREEZE_ENTRY localEntries[DBK_MAX_STEALTH_FREEZE_ENTRIES];
+		ULONG localCount = 0;
+		ULONG i;
+
+		if (g_StealthFreezeMutexInited)
+		{
+			ExAcquireFastMutex(&g_StealthFreezeMutex);
+			localCount = g_StealthFreezeCount;
+			if (localCount > DBK_MAX_STEALTH_FREEZE_ENTRIES)
+				localCount = DBK_MAX_STEALTH_FREEZE_ENTRIES;
+			if (localCount > 0)
+				RtlCopyMemory(localEntries, g_StealthFreezeEntries, localCount * sizeof(DBK_STEALTH_FREEZE_ENTRY));
+			ExReleaseFastMutex(&g_StealthFreezeMutex);
+		}
+
+		for (i = 0; i < localCount; i++)
+		{
+			if (InterlockedCompareExchange(&g_StealthFreezeStop, 0, 0) != 0)
+				break;
+
+			if (localEntries[i].Enabled &&
+				localEntries[i].ProcessId != 0 &&
+				localEntries[i].Address != 0 &&
+				(localEntries[i].Size == 1 || localEntries[i].Size == 2 || localEntries[i].Size == 4 || localEntries[i].Size == 8))
+			{
+				UINT64 currentVal = 0;
+				DWORD pid = (DWORD)localEntries[i].ProcessId;
+				PVOID addr = (PVOID)(UINT_PTR)localEntries[i].Address;
+				DWORD sz = (DWORD)localEntries[i].Size;
+
+				// Conditional Read-Before-Write in Ring-0: only write if the target changed the value
+				if (ReadProcessMemory(pid, NULL, addr, sz, &currentVal))
+				{
+					if (RtlCompareMemory(&currentVal, &localEntries[i].Value64, sz) != sz)
+					{
+						WriteProcessMemory(pid, NULL, addr, sz, &localEntries[i].Value64);
+					}
+				}
+			}
+		}
+
+		// Micro-jittered kernel delay: 9ms .. 17ms (in 100ns negative relative units)
+		jitterSeed = jitterSeed * 1664525UL + 1013904223UL;
+		{
+			LARGE_INTEGER interval;
+			LONGLONG delayMs = (localCount > 0) ? (9LL + (LONGLONG)(jitterSeed % 9UL)) : 25LL;
+			interval.QuadPart = -10000LL * delayMs;
+			KeDelayExecutionThread(KernelMode, FALSE, &interval);
+		}
+	}
+
+	PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+void StealthFreeze_Init(void)
+{
+	if (!g_StealthFreezeMutexInited)
+	{
+		ExInitializeFastMutex(&g_StealthFreezeMutex);
+		RtlZeroMemory(g_StealthFreezeEntries, sizeof(g_StealthFreezeEntries));
+		g_StealthFreezeCount = 0;
+		g_StealthFreezeStop = 0;
+		g_StealthFreezeThreadObj = NULL;
+		g_StealthFreezeMutexInited = TRUE;
+	}
+}
+
+void StealthFreeze_Shutdown(void)
+{
+	InterlockedExchange(&g_StealthFreezeStop, 1);
+	if (g_StealthFreezeThreadObj != NULL)
+	{
+		KeWaitForSingleObject(g_StealthFreezeThreadObj, Executive, KernelMode, FALSE, NULL);
+		ObDereferenceObject(g_StealthFreezeThreadObj);
+		g_StealthFreezeThreadObj = NULL;
+	}
+	if (g_StealthFreezeMutexInited)
+	{
+		ExAcquireFastMutex(&g_StealthFreezeMutex);
+		g_StealthFreezeCount = 0;
+		RtlZeroMemory(g_StealthFreezeEntries, sizeof(g_StealthFreezeEntries));
+		ExReleaseFastMutex(&g_StealthFreezeMutex);
+	}
+}
+
+NTSTATUS StealthFreeze_Sync(PVOID SystemBuffer, ULONG InputBufferLength)
+{
+	PDBK_STEALTH_FREEZE_LIST inList;
+	ULONG count;
+
+	if (!SystemBuffer || InputBufferLength < sizeof(ULONG) * 2)
+		return STATUS_INVALID_PARAMETER;
+
+	if (!g_StealthFreezeMutexInited)
+		StealthFreeze_Init();
+
+	inList = (PDBK_STEALTH_FREEZE_LIST)SystemBuffer;
+	count = inList->Count;
+	if (count > DBK_MAX_STEALTH_FREEZE_ENTRIES)
+		count = DBK_MAX_STEALTH_FREEZE_ENTRIES;
+
+	if (InputBufferLength < (sizeof(ULONG) * 2 + count * sizeof(DBK_STEALTH_FREEZE_ENTRY)))
+		return STATUS_BUFFER_TOO_SMALL;
+
+	ExAcquireFastMutex(&g_StealthFreezeMutex);
+	g_StealthFreezeCount = count;
+	if (count > 0)
+		RtlCopyMemory(g_StealthFreezeEntries, inList->Entries, count * sizeof(DBK_STEALTH_FREEZE_ENTRY));
+	else
+		RtlZeroMemory(g_StealthFreezeEntries, sizeof(g_StealthFreezeEntries));
+	ExReleaseFastMutex(&g_StealthFreezeMutex);
+
+	if (count > 0 && g_StealthFreezeThreadObj == NULL && InterlockedCompareExchange(&g_StealthFreezeStop, 0, 0) == 0)
+	{
+		HANDLE hThread = NULL;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, &oa, NULL, NULL, StealthFreezeKernelThread, NULL)))
+		{
+			ObReferenceObjectByHandle(hThread, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID*)&g_StealthFreezeThreadObj, NULL);
+			ZwClose(hThread);
+		}
+	}
+
+	return STATUS_SUCCESS;
 }

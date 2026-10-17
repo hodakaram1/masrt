@@ -119,3 +119,7 @@ BOOLEAN HiddenDriver;
 #define SE_IncorrectType -1
 #define SE_NotSupported -2
 #define SE_NoMemoryFound -3
+
+void StealthFreeze_Init(void);
+void StealthFreeze_Shutdown(void);
+NTSTATUS StealthFreeze_Sync(PVOID SystemBuffer, ULONG InputBufferLength);

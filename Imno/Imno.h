@@ -77,7 +77,11 @@
 #define IOCTL_CE_GETCR0               CTL_CODE(IOCTL_UNKNOWN_BASE, 0x082e, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_READMSR              CTL_CODE(IOCTL_UNKNOWN_BASE, 0x083f, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_WRITEMSR             CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0840, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_WRITESIGNOREWP       CTL_CODE(IOCTL_UNKNOWN_BASE, 0x084b, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_CE_FREE_NONPAGED        CTL_CODE(IOCTL_UNKNOWN_BASE, 0x084c, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_CE_STEALTH_FREEZE_SYNC  CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0863, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+#define DBK_MAX_STEALTH_FREEZE_ENTRIES 64
 
 // Maximum addresses kept from a first scan (scanner reports truncation past this)
 #define MAX_SCAN_RESULTS 200000
@@ -127,6 +131,20 @@ typedef struct _DBK_VA_TO_PA {
     ULONG64 ProcessId;
     ULONG64 BaseAddress;
 } DBK_VA_TO_PA, *PDBK_VA_TO_PA;
+
+typedef struct _DBK_STEALTH_FREEZE_ENTRY {
+    ULONG64 ProcessId;
+    ULONG64 Address;
+    ULONG64 Value64;
+    ULONG   Size;
+    ULONG   Enabled;
+} DBK_STEALTH_FREEZE_ENTRY, *PDBK_STEALTH_FREEZE_ENTRY;
+
+typedef struct _DBK_STEALTH_FREEZE_LIST {
+    ULONG Count;
+    ULONG Reserved;
+    DBK_STEALTH_FREEZE_ENTRY Entries[DBK_MAX_STEALTH_FREEZE_ENTRIES];
+} DBK_STEALTH_FREEZE_LIST, *PDBK_STEALTH_FREEZE_LIST;
 #pragma pack(pop)
 
 // IOCTL_CE_QUERY_VIRTUAL_MEMORY (0x0803):
@@ -192,9 +210,11 @@ struct CheatItem {
     ULONG_PTR Address;
     ULONG64   Value64;
     bool      Enabled;
-    int       DataType;   // size/type captured when the item was added
-    ULONG     Pid;        // process captured when the item was added
+    int       DataType;           // size/type captured when the item was added
+    ULONG     Pid;                // process captured when the item was added
     char      Description[64];
+    ULONG64   PhysicalAddress = 0; // cached physical RAM address (IOCTL_CE_GETPHYSICALADDRESS)
+    ULONG     WriteHits = 0;       // count of stealth restores when the game changed the value
 };
 
 // =====================================================================
@@ -246,8 +266,11 @@ bool DbkReadMsr(ULONG msr, ULONG64* out);
 bool DbkWriteMsr(ULONG64 msr, ULONG64 value);
 bool DbkGetIdt(USHORT* limit, ULONG_PTR* base);
 bool DbkGetGdt(USHORT* limit, ULONG_PTR* base);
+bool DbkGetPhysicalAddress(ULONG pid, ULONG_PTR virtualAddr, ULONG64* outPhysAddr);
 bool DbkReadPhysical(ULONG64 addr, void* out, ULONG size);
 bool DbkWritePhysical(ULONG64 addr, const void* in, ULONG size);
+bool DbkSetWritesIgnoreWP(bool enable);
+bool DbkSyncStealthFreeze();
 bool DbkAllocNonPaged(ULONG size, ULONG64* out);
 bool DbkFreeNonPaged(ULONG64 addr);
 bool DbkAllocProcessMem(ULONG pid, ULONG64 size, ULONG64* out);
